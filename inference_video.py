@@ -68,6 +68,7 @@ parser.add_argument('--png', dest='png', action='store_true', help='whether to v
 parser.add_argument('--ext', dest='ext', type=str, default='mp4', help='vid_out video extension')
 parser.add_argument('--exp', dest='exp', type=int, default=1)
 parser.add_argument('--multi', dest='multi', type=int, default=2)
+parser.add_argument('--drop', dest='drop', type=int, default=1, help='drop rate for frames (1 means every frame, 2 means every other, etc.)')
 
 args = parser.parse_args()
 if args.exp != 1:
@@ -149,7 +150,9 @@ def clear_write_buffer(user_args, write_buffer):
             cv2.imwrite('vid_out/{:0>7d}.png'.format(cnt), item[:, :, ::-1])
             cnt += 1
         else:
-            vid_out.write(item[:, :, ::-1])
+            if cnt % user_args.drop == 0:
+                vid_out.write(item[:, :, ::-1])
+            cnt += 1
 
 def build_read_buffer(user_args, read_buffer, videogen):
     try:
@@ -281,7 +284,7 @@ if not vid_out is None:
     vid_out.release()
 
 # move audio to new video file if appropriate
-if args.png == False and fpsNotAssigned == True and not args.video is None:
+if args.png == False and fpsNotAssigned == True and not args.video is None and args.drop == 1:
     try:
         transferAudio(args.video, vid_out_name)
     except:
