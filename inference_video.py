@@ -114,7 +114,7 @@ if not args.video is None:
     fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
     video_path_wo_ext, ext = os.path.splitext(args.video)
     print('{}.{}, {} frames in total, {}FPS to {}FPS'.format(video_path_wo_ext, args.ext, tot_frame, fps, args.fps))
-    if args.png == False and fpsNotAssigned == True:
+    if args.png == False and fpsNotAssigned == True and args.drop == 1:
         print("The audio will be merged after interpolation process")
     else:
         print("Will not merge audio because using png or fps flag!")
