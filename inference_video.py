@@ -11,6 +11,7 @@ import skvideo.io
 from queue import Queue, Empty
 from model.pytorch_msssim import ssim_matlab
 from vidgear.gears import WriteGear
+from vidgear.gears import VideoGear
 
 warnings.filterwarnings("ignore")
 
@@ -110,8 +111,9 @@ if not args.video is None:
         args.fps = fps * args.multi
     else:
         fpsNotAssigned = False
-    videogen = skvideo.io.vreader(args.video)
-    lastframe = next(videogen)
+    videogen = VideoGear(source=args.video).start()
+    first_frame = videogen.read()
+    lastframe = first_frame.copy() if first_frame is not None else None
     video_path_wo_ext, ext = os.path.splitext(args.video)
     print('{}.{}, {} frames in total, {}FPS to {}FPS'.format(video_path_wo_ext, args.ext, tot_frame, fps, args.fps))
     if args.png == False and fpsNotAssigned == True and args.drop == 1:
@@ -164,12 +166,16 @@ def clear_write_buffer(user_args, write_buffer):
 
 def build_read_buffer(user_args, read_buffer, videogen):
     try:
-        for frame in videogen:
-            if not user_args.img is None:
+        if not user_args.video is None:  # For video input
+            while True:
+                frame = videogen.read()
+                if frame is None:
+                    break
+                read_buffer.put(frame)
+        else:  # For image input
+            for frame in videogen:
                 frame = cv2.imread(os.path.join(user_args.img, frame), cv2.IMREAD_UNCHANGED)[:, :, ::-1].copy()
-            if user_args.montage:
-                frame = frame[:, left: left + w]
-            read_buffer.put(frame)
+                read_buffer.put(frame)
     except:
         pass
     read_buffer.put(None)
