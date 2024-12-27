@@ -299,7 +299,7 @@ while(not write_buffer.empty()):
     time.sleep(0.1)
 pbar.close()
 if not vid_out is None:
-    vid_out.release()
+    vid_out.close()
 
 # move audio to new video file if appropriate
 if args.png == False and fpsNotAssigned == True and not args.video is None and args.drop == 1:
