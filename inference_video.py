@@ -111,7 +111,7 @@ if not args.video is None:
         fpsNotAssigned = False
     videogen = skvideo.io.vreader(args.video)
     lastframe = next(videogen)
-    fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
+    fourcc = cv2.VideoWriter_fourcc(*'X264')
     video_path_wo_ext, ext = os.path.splitext(args.video)
     print('{}.{}, {} frames in total, {}FPS to {}FPS'.format(video_path_wo_ext, args.ext, tot_frame, fps, args.fps))
     if args.png == False and fpsNotAssigned == True and args.drop == 1:
