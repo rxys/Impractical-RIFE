@@ -140,7 +140,7 @@ else:
     output_params = {
         "-vcodec": "libx264",     # Use H.264 codec
         "-preset": "medium",      # Medium speed/quality tradeoff
-        "-r": args.fps,           # Set frames per second
+        "-input_framerate": args.fps, # Set frames per second
         "-crf": 20,               # Constant rate factor for good quality
     }
     
@@ -155,13 +155,13 @@ def clear_write_buffer(user_args, write_buffer):
     while True:
         item = write_buffer.get()
         if item is None:
-            break
+            brea
         if user_args.png:
             cv2.imwrite('vid_out/{:0>7d}.png'.format(cnt), item[:, :, ::-1])
             cnt += 1
         else:
             if cnt % user_args.drop == 0:
-                vid_out.write(item[:, :, ::-1])  # Write the frame using VidGear
+                vid_out.write(item)  # Write the frame using VidGear
             cnt += 1
 
 def build_read_buffer(user_args, read_buffer, videogen):
@@ -171,26 +171,6 @@ def build_read_buffer(user_args, read_buffer, videogen):
             if user_args.montage:
                 frame = frame[:, left: left + w]
             read_buffer.put(frame)
-    except:
-        pass
-    read_buffer.put(None)
-
-def build_read_buffer(user_args, read_buffer, videogen):
-    try:
-        if not user_args.video is None:  # For video input
-            while True:
-                frame = videogen.read()
-                if frame is None:
-                    break
-                if user_args.montage:
-                    frame = frame[:, left: left + w]
-                read_buffer.put(frame)
-        else:  # For image input
-            for frame in videogen:
-                frame = cv2.imread(os.path.join(user_args.img, frame), cv2.IMREAD_UNCHANGED)[:, :, ::-1].copy()
-                if user_args.montage:
-                    frame = frame[:, left: left + w]
-                read_buffer.put(frame)
     except:
         pass
     read_buffer.put(None)
