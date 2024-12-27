@@ -146,7 +146,7 @@ else:
         vid_out_name = args.output
     else:
         vid_out_name = '{}_{}X_{}fps.{}'.format(video_path_wo_ext, args.multi, int(np.round(args.fps)), args.ext)
-    vid_out = WriteGear(output_filename=vid_out_name, logging=True, **output_params)
+    vid_out = WriteGear(output=vid_out_name, logging=True, **output_params)
 
 def clear_write_buffer(user_args, write_buffer):
     cnt = 0
