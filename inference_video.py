@@ -166,15 +166,30 @@ def clear_write_buffer(user_args, write_buffer):
 
 def build_read_buffer(user_args, read_buffer, videogen):
     try:
+        frame_fetch = videogen.read if user_args.video else lambda: cv2.imread(os.path.join(user_args.img, next(videogen)), cv2.IMREAD_UNCHANGED)[:, :, ::-1].copy()
+        while (frame := frame_fetch()):
+            if user_args.montage:
+                frame = frame[:, left: left + w]
+            read_buffer.put(frame)
+    except:
+        pass
+    read_buffer.put(None)
+
+def build_read_buffer(user_args, read_buffer, videogen):
+    try:
         if not user_args.video is None:  # For video input
             while True:
                 frame = videogen.read()
                 if frame is None:
                     break
+                if user_args.montage:
+                    frame = frame[:, left: left + w]
                 read_buffer.put(frame)
         else:  # For image input
             for frame in videogen:
                 frame = cv2.imread(os.path.join(user_args.img, frame), cv2.IMREAD_UNCHANGED)[:, :, ::-1].copy()
+                if user_args.montage:
+                    frame = frame[:, left: left + w]
                 read_buffer.put(frame)
     except:
         pass
