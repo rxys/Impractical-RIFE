@@ -10,6 +10,7 @@ import _thread
 import skvideo.io
 from queue import Queue, Empty
 from model.pytorch_msssim import ssim_matlab
+from vidgear.gears import WriteGear
 
 warnings.filterwarnings("ignore")
 
@@ -134,11 +135,18 @@ if args.png:
     if not os.path.exists('vid_out'):
         os.mkdir('vid_out')
 else:
+    # Initialize VidGear writer with H.264 encoding
+    output_params = {
+        "-vcodec": "libx264",  # Video codec
+        "-crf": "20",          # Constant Rate Factor (lower is better quality)
+        "-preset": "fast"      # Encoding speed/quality trade-off
+    }
+    
     if args.output is not None:
         vid_out_name = args.output
     else:
         vid_out_name = '{}_{}X_{}fps.{}'.format(video_path_wo_ext, args.multi, int(np.round(args.fps)), args.ext)
-    vid_out = cv2.VideoWriter(vid_out_name, fourcc, args.fps, (w, h))
+    vid_out = WriteGear(output_filename=vid_out_name, logging=True, **output_params)
 
 def clear_write_buffer(user_args, write_buffer):
     cnt = 0
@@ -151,7 +159,7 @@ def clear_write_buffer(user_args, write_buffer):
             cnt += 1
         else:
             if cnt % user_args.drop == 0:
-                vid_out.write(item[:, :, ::-1])
+                vid_out.write(item[:, :, ::-1])  # Write the frame using VidGear
             cnt += 1
 
 def build_read_buffer(user_args, read_buffer, videogen):
