@@ -155,7 +155,7 @@ def clear_write_buffer(user_args, write_buffer):
     while True:
         item = write_buffer.get()
         if item is None:
-            brea
+            break
         if user_args.png:
             cv2.imwrite('vid_out/{:0>7d}.png'.format(cnt), item[:, :, ::-1])
             cnt += 1
@@ -218,8 +218,8 @@ padding = (0, pw - w, 0, ph - h)
 pbar = tqdm(total=tot_frame)
 if args.montage:
     lastframe = lastframe[:, left: left + w]
-write_buffer = Queue(maxsize=500)
-read_buffer = Queue(maxsize=500)
+write_buffer = Queue(maxsize=125)
+read_buffer = Queue(maxsize=125)
 _thread.start_new_thread(build_read_buffer, (args, read_buffer, videogen))
 _thread.start_new_thread(clear_write_buffer, (args, write_buffer))
 
