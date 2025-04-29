@@ -111,7 +111,7 @@ if not args.video is None:
         args.fps = fps * args.multi
     else:
         fpsNotAssigned = False
-    videogen = VideoGear(source=args.video).start()
+    videogen = VideoGear(source=args.video, backend='ffmpeg').start()
     first_frame = videogen.read()
     lastframe = first_frame.copy() if first_frame is not None else None
     video_path_wo_ext, ext = os.path.splitext(args.video)
