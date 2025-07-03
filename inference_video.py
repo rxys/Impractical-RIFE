@@ -72,6 +72,7 @@ parser.add_argument('--exp', dest='exp', type=int, default=1)
 parser.add_argument('--multi', dest='multi', type=int, default=2)
 parser.add_argument('--drop', dest='drop', type=int, default=1, help='drop rate for frames (1 means every frame, 2 means every other, etc.)')
 parser.add_argument('--drop_input', dest='drop_input', type=int, default=1, help='Only keep every Nth input frame (1 = keep all, 2 = drop every other, etc.)')
+parser.add_argument('--fixed_height', type=int, default=None, help='Fixed vertical resolution for downscaling while keeping aspect ratio')
 
 args = parser.parse_args()
 if args.exp != 1:
@@ -130,7 +131,14 @@ else:
     videogen.sort(key= lambda x:int(x[:-4]))
     lastframe = cv2.imread(os.path.join(args.img, videogen[0]), cv2.IMREAD_UNCHANGED)[:, :, ::-1].copy()
     videogen = videogen[1:]
+
 h, w, _ = lastframe.shape
+if args.fixed_height is not None:
+    orig_h, orig_w = h, w
+    new_h = args.fixed_height
+    new_w = int(orig_w * (new_h / orig_h))
+    lastframe = cv2.resize(lastframe, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    h, w = new_h, new_w
 vid_out_name = None
 vid_out = None
 if args.png:
@@ -173,6 +181,8 @@ def build_read_buffer(user_args, read_buffer, videogen):
                 frame = videogen.read()
                 if frame is None:
                     break
+                if args.fixed_height is not None:
+                    frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
                 if frame_index % user_args.drop_input == 0:
                     if user_args.montage:
                         frame = frame[:, left: left + w]
