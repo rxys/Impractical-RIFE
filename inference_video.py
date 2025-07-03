@@ -71,6 +71,7 @@ parser.add_argument('--ext', dest='ext', type=str, default='mp4', help='vid_out 
 parser.add_argument('--exp', dest='exp', type=int, default=1)
 parser.add_argument('--multi', dest='multi', type=int, default=2)
 parser.add_argument('--drop', dest='drop', type=int, default=1, help='drop rate for frames (1 means every frame, 2 means every other, etc.)')
+parser.add_argument('--drop_input', dest='drop_input', type=int, default=1, help='Only keep every Nth input frame (1 = keep all, 2 = drop every other, etc.)')
 
 args = parser.parse_args()
 if args.exp != 1:
@@ -167,19 +168,25 @@ def clear_write_buffer(user_args, write_buffer):
 def build_read_buffer(user_args, read_buffer, videogen):
     try:
         if not user_args.video is None:  # For video input
+            frame_index = 0
             while True:
                 frame = videogen.read()
                 if frame is None:
                     break
-                if user_args.montage:
-                    frame = frame[:, left: left + w]
-                read_buffer.put(frame)
+                if frame_index % user_args.drop_input == 0:
+                    if user_args.montage:
+                        frame = frame[:, left: left + w]
+                    read_buffer.put(frame)
+                frame_index += 1
         else:  # For image input
-            for frame in videogen:
-                frame = cv2.imread(os.path.join(user_args.img, frame), cv2.IMREAD_UNCHANGED)[:, :, ::-1].copy()
-                if user_args.montage:
-                    frame = frame[:, left: left + w]
-                read_buffer.put(frame)
+            frame_index = 0
+            for frame_name in videogen:
+                if frame_index % user_args.drop_input == 0:
+                    frame = cv2.imread(os.path.join(user_args.img, frame_name), cv2.IMREAD_UNCHANGED)[:, :, ::-1].copy()
+                    if user_args.montage:
+                        frame = frame[:, left: left + w]
+                    read_buffer.put(frame)
+                frame_index += 1
     except:
         pass
     read_buffer.put(None)
