@@ -109,7 +109,7 @@ if not args.video is None:
     videoCapture.release()
     if args.fps is None:
         fpsNotAssigned = True
-        args.fps = fps * args.multi
+        args.fps = fps / args.drop_input * args.multi / args.drop
     else:
         fpsNotAssigned = False
     videogen = VideoGear(source=args.video, backend='ffmpeg').start()
@@ -309,7 +309,7 @@ if not vid_out is None:
     vid_out.close()
 
 # move audio to new video file if appropriate
-if args.png == False and fpsNotAssigned == True and not args.video is None and args.drop == 1:
+if args.png == False and fpsNotAssigned == True and not args.video is None and args.drop == 1 and args.drop_input == 1:
     try:
         transferAudio(args.video, vid_out_name)
     except:
