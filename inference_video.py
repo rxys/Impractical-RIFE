@@ -148,8 +148,7 @@ else:
       "-vcodec": "h264_nvenc",     # Use NVIDIA GPU encoder
       "-preset": "p4",             # NVENC preset (e.g., p1=preset slow, p7=ultrafast)
       "-cq": "27",                 # Quality (like CRF for NVENC)
-      "-input_framerate": str(args.fps),  # Input FPS
-      "-pix_fmt": "yuv420p",       # Ensure wide compatibility
+      "-input_framerate": args.fps,  # Input FPS
     }
     
     if args.output is not None:
