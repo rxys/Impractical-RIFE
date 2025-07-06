@@ -147,10 +147,11 @@ if args.png:
 else:
     # Initialize VidGear writer with H.264 encoding
     output_params = {
-        "-vcodec": "libx264",     # Use H.264 codec
-        "-preset": "medium",      # Medium speed/quality tradeoff
-        "-input_framerate": args.fps, # Set frames per second
-        "-crf": 20,               # Constant rate factor for good quality
+      "-vcodec": "h264_nvenc",     # Use NVIDIA GPU encoder
+      "-preset": "p4",             # NVENC preset (e.g., p1=preset slow, p7=ultrafast)
+      "-cq": "27",                 # Quality (like CRF for NVENC)
+      "-input_framerate": str(args.fps),  # Input FPS
+      "-pix_fmt": "yuv420p",       # Ensure wide compatibility
     }
     
     if args.output is not None:
