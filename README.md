@@ -7,7 +7,7 @@
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/smoothie.git
+git clone https://github.com/rxys/Impractical-RIFE.git
 cd smoothie
 pip install -r requirements.txt
 ```
