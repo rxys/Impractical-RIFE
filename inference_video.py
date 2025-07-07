@@ -69,13 +69,27 @@ if args.png:
     if not os.path.exists('vid_out'):
         os.mkdir('vid_out')
 else:
-    # Initialize VidGear writer with H.264 encoding
     output_params = {
-      "-vcodec": "h264_nvenc",     # Use NVIDIA GPU encoder
-      "-preset": "p4",             # NVENC preset (e.g., p1=preset slow, p7=ultrafast)
-      "-cq": "27",                 # Quality (like CRF for NVENC)
-      "-input_framerate": args.fps,  # Input FPS
-      "-pix_fmt": "yuv420p"
+        "-input_framerate": args.fps,
+        "-vcodec": "h264_nvenc",
+        "-rc": "vbr_hq",
+        "-cq": "22",
+        "-maxrate": "50M",
+        "-bufsize": "100M",          # 2x maxrate
+        "-preset": "p5",
+        "-rc-lookahead": "48",
+        "-spatial_aq": "1",
+        "-temporal_aq": "1",
+        "-aq-strength": "10",
+        "-bf": "3",
+        "-refs": "4",
+        "-g": "120",
+        "-profile:v": "high",
+        "-pix_fmt": "yuv420p",
+        "-b:v": "0",
+        # Only if Turing/Ampere GPU:
+        "-tune": "hq",
+        "-weighted_pred": "1"
     }
     
     if args.output is not None:
