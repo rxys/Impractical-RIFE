@@ -8,7 +8,6 @@ from torch.nn import functional as F
 import warnings
 import _thread
 from queue import Queue, Empty
-from model.pytorch_msssim import ssim_matlab
 from vidgear.gears import WriteGear
 from vidgear.gears import VideoGear
 
@@ -53,8 +52,6 @@ videogen = VideoGear(source=args.video, backend='ffmpeg').start()
 first_frame = videogen.read()
 lastframe = first_frame.copy() if first_frame is not None else None
 video_path_wo_ext, ext = os.path.splitext(args.video)
-print('{}.{}, {} frames in total, {}FPS to {}FPS'.format(video_path_wo_ext, args.ext, tot_frames, source_fps, args.fps))
-
 h, w, _ = lastframe.shape
 if args.fixed_height is not None:
     orig_h, orig_w = h, w
@@ -62,6 +59,27 @@ if args.fixed_height is not None:
     new_w = int(orig_w * (new_h / orig_h))
     h, w = new_h, new_w
     lastframe = cv2.resize(lastframe, (w, h), interpolation=cv2.INTER_AREA)
+print('{}.{}, {} frames in total, {}FPS to {}FPS'.format(video_path_wo_ext, args.ext, tot_frames, source_fps, args.fps))
+
+# CHANGED: Run ffmpeg to get scene change frame indices on demand
+print("Running ffmpeg scene detection...")
+scene_changes = set()
+ffmpeg_cmd = [
+    "ffmpeg", "-i", args.video,
+    "-vf", "select='gt(scene,0.4)',showinfo",
+    "-f", "null", "-"
+]
+result = subprocess.run(ffmpeg_cmd, stderr=subprocess.PIPE, text=True)
+for line in result.stderr.splitlines():
+    if "showinfo" in line and "pts_time" in line:
+        if "n:" in line:
+            parts = line.split("n:")
+            try:
+                frame_num = int(parts[1].split()[0])
+                scene_changes.add(frame_num - 1)  # CHANGED: shift to duplicate *before* scene change
+            except:
+                continue
+print(f"Detected {len(scene_changes)} scene changes via ffmpeg.")
 
 vid_out_name = None
 vid_out = None
@@ -72,7 +90,7 @@ else:
     output_params = {
         "-input_framerate": args.fps,
         "-vcodec": "h264_nvenc",
-        "-rc": "vbr_hq",
+        "-rc": "vbr",
         "-cq": "22",
         "-maxrate": "50M",
         "-bufsize": "100M",          # 2x maxrate
@@ -162,14 +180,11 @@ while True:
     I0 = I1
     I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
     I1 = pad_image(I1)
-    I0_small = F.interpolate(I0, (32, 32), mode='bilinear', align_corners=False)
-    I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
-    ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
 
     output = []
     close_enough = 0.0001
     while time + timestep <= n + 1 + close_enough:
-        if ssim < 0.2:
+        if (n + 1) in scene_changes:
             output.append(I0)
         else:
             assert model.version >= 3.9
