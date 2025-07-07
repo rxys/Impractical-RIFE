@@ -118,7 +118,9 @@ def pad_image(img):
     else:
         return F.pad(img, padding)
 
-tmp = max(128, int(128 / args.scale))
+scale = 1
+
+tmp = max(128, int(128 / scale))
 ph = ((h - 1) // tmp + 1) * tmp
 pw = ((w - 1) // tmp + 1) * tmp
 padding = (0, pw - w, 0, ph - h)
@@ -159,7 +161,7 @@ while True:
             temp = frame
         I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
         I1 = pad_image(I1)
-        I1 = model.inference(I0, I1, scale=args.scale)
+        I1 = model.inference(I0, I1, scale)
         I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
         ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
         frame = (I1[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
@@ -177,7 +179,7 @@ while True:
             elif d > 1 - close_enough:
                 res = I1
             else:
-                res = model.inference(I0, I1, d, args.scale)
+                res = model.inference(I0, I1, d, scale)
             output.append(res)
         time += timestep
 
