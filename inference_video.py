@@ -7,9 +7,11 @@ from tqdm import tqdm
 from torch.nn import functional as F
 import warnings
 import _thread
+import subprocess
 from queue import Queue, Empty
 from vidgear.gears import WriteGear
 from vidgear.gears import VideoGear
+import math
 
 warnings.filterwarnings("ignore")
 
@@ -76,7 +78,7 @@ for line in result.stderr.splitlines():
             parts = line.split("n:")
             try:
                 frame_num = int(parts[1].split()[0])
-                scene_changes.add(frame_num - 1)  # CHANGED: shift to duplicate *before* scene change
+                scene_changes.add(math.ceil(frame_num / args.drop_input))
             except:
                 continue
 print(f"Detected {len(scene_changes)} scene changes via ffmpeg.")
@@ -107,7 +109,6 @@ else:
         "-b:v": "0",
         # Only if Turing/Ampere GPU:
         "-tune": "hq",
-        "-weighted_pred": "1"
     }
     
     if args.output is not None:
