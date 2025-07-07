@@ -169,7 +169,7 @@ while True:
 
     output = []
     close_enough = 0.0001
-    while time + timestep < n + 1 - close_enough:
+    while time + timestep <= n + 1 + close_enough:
         if ssim < 0.2:
             output.append(I0)
         else:
