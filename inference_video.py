@@ -152,21 +152,6 @@ while True:
     I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
     ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
 
-    break_flag = False
-    if ssim > 0.996:
-        frame = read_buffer.get() # read a new frame
-        if frame is None:
-            break_flag = True
-            frame = lastframe
-        else:
-            temp = frame
-        I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
-        I1 = pad_image(I1)
-        I1 = model.inference(I0, I1, scale)
-        I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
-        ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
-        frame = (I1[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
-
     output = []
     close_enough = 0.0001
     while time + timestep <= n + 1 + close_enough:
@@ -191,8 +176,6 @@ while True:
     pbar.update(1)
     n += 1
     lastframe = frame
-    if break_flag:
-        break
 
 write_buffer.put(lastframe)
 write_buffer.put(None)
