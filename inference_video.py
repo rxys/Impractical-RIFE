@@ -75,6 +75,7 @@ else:
       "-preset": "p4",             # NVENC preset (e.g., p1=preset slow, p7=ultrafast)
       "-cq": "27",                 # Quality (like CRF for NVENC)
       "-input_framerate": args.fps,  # Input FPS
+      "-pix_fmt": "yuv420p"
     }
     
     if args.output is not None:
