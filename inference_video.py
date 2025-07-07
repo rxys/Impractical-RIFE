@@ -169,7 +169,6 @@ while True:
             output.append(res)
         time += timestep
 
-    write_buffer.put(lastframe)
     for mid in output:
         mid = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
         write_buffer.put(mid[:h, :w])
