@@ -93,7 +93,7 @@ else:
         "-input_framerate": args.fps,
         "-vcodec": "h264_nvenc",
         "-rc": "vbr",
-        "-cq": "22",
+        "-cq": "24",
         "-maxrate": "50M",
         "-bufsize": "100M",          # 2x maxrate
         "-preset": "p5",
