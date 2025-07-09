@@ -64,25 +64,44 @@ if args.fixed_height is not None:
     lastframe = cv2.resize(lastframe, (w, h), interpolation=cv2.INTER_AREA)
 print('{}.{}, {} frames in total, {}FPS to {}FPS'.format(video_path_wo_ext, args.ext, tot_frames, source_fps, args.fps))
 
-# CHANGED: Run ffmpeg to get scene change frame indices on demand
-print("Running ffmpeg scene detection...")
-scene_changes = set()
-ffmpeg_cmd = [
-    "ffmpeg", "-i", args.video,
-    "-vf", "select='gt(scene,0.4)',showinfo",
-    "-f", "null", "-"
-]
-result = subprocess.run(ffmpeg_cmd, stderr=subprocess.PIPE, text=True)
-for line in result.stderr.splitlines():
-    if "showinfo" in line and "pts_time" in line:
-        if "n:" in line:
-            parts = line.split("n:")
-            try:
-                frame_num = int(parts[1].split()[0])
-                scene_changes.add(math.ceil(frame_num / args.drop_input))
-            except:
-                continue
-print(f"Detected {len(scene_changes)} scene changes via ffmpeg.")
+def detect_scenes():
+    pattern = re.compile(
+        r"showinfo.*?\bn:\s*(\d+).*?\bpts:\s*(\d+)",
+        re.IGNORECASE
+    )
+
+    def parse_showinfo(stderr):
+        # Match lines containing showinfo with 'n:' and 'pts_time:'
+        for line in stderr.splitlines():
+            m = pattern.search(line)    
+            if m:
+                n = int(m.group(1))
+                pts = int(m.group(2))
+                yield n, pts
+
+    print("Running stupid 2-pass scene detection...")
+
+    # 1st pass: full showinfo to map pts_time -> frame
+    out1 = subprocess.run(
+        ["ffmpeg", "-i", args.video, "-vf", "showinfo", "-f", "null", "-", "-hide_banner"],
+        stderr=subprocess.PIPE, text=True
+    )
+    pts_to_frame = {pts: frame for frame, pts in parse_showinfo(out1.stderr)}
+
+    # 2nd pass: scene-detected pts_times
+    out2 = subprocess.run(
+        ["ffmpeg", "-i", args.video, "-vf", "select='gt(scene,0.4)',showinfo", "-f", "null", "-", "-hide_banner"],
+        stderr=subprocess.PIPE, text=True
+    )
+    scene_changes = {
+        math.ceil(pts_to_frame[pts] / args.drop_input)
+        for _, pts in parse_showinfo(out2.stderr)
+        if pts in pts_to_frame
+    }
+    return scene_changes
+
+scene_changes = detect_scenes()
+print(f"Detected {len(scene_changes)} scene changes via ffmpeg.\n{scene_changes}")
 
 vid_out_name = None
 vid_out = None
@@ -239,13 +258,11 @@ def draw_debug_visual(frame, n, d, frame_type):
     text_x = x_current - text_size[0] // 2
     cv2.putText(frame, label, (text_x, timeline_y - 20), 
                 font, font_scale*0.9, color, font_thickness)
-    if which_side is None:
-        pass
-    elif which_side != 0:
+    if which_side != 0:
         cv2.circle(frame, (x_start, timeline_y), marker_size, (200, 200, 200), thickness)
         cv2.putText(frame, f"{n}", (x_start-15, timeline_y-20), 
                     font, font_scale*0.9, (200, 200, 200), font_thickness)
-    elif which_side != 1:
+    if which_side != 1:
         cv2.circle(frame, (x_end, timeline_y), marker_size, (200, 200, 200), thickness)
         cv2.putText(frame, f"{n+1}", (x_end-25, timeline_y-20), 
             font, font_scale*0.9, (200, 200, 200), font_thickness)
@@ -265,7 +282,7 @@ while True:
     
     output = []
     close_enough = 0.0001
-    while time + timestep <= n + 1 + close_enough:
+    while time <= n + 1 + close_enough:
         d = time - n
         
         if (n + 1) in scene_changes:
