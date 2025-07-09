@@ -193,7 +193,7 @@ def draw_debug_visual(frame, n, d, frame_type):
     font = cv2.FONT_HERSHEY_DUPLEX
     font_scale = 1.5
     font_thickness = 2
-    margin = 30
+    margin = 80
     timeline_w = 400
     timeline_y = 100
     marker_size = 10  # Base size for markers
