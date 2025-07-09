@@ -25,6 +25,7 @@ parser.add_argument('--png', dest='png', action='store_true', help='whether to v
 parser.add_argument('--ext', dest='ext', type=str, default='mp4', help='vid_out video extension')
 parser.add_argument('--drop_input', dest='drop_input', type=int, default=1, help='Only keep every Nth input frame (1 = keep all, 2 = drop every other, etc.)')
 parser.add_argument('--fixed_height', type=int, default=None, help='Fixed vertical resolution for downscaling while keeping aspect ratio')
+parser.add_argument('--debug', dest='debug', action='store_true', help='Enable debug visualization')
 
 args = parser.parse_args()
 
@@ -170,38 +171,113 @@ temp = None # save lastframe when processing static frame
 time = 0
 n = 0
 
-while True:
-    if temp is not None:
-        frame = temp
-        temp = None
-    else:
-        frame = read_buffer.get()
-    if frame is None:
-        break
-    I0 = I1
-    I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
-    I1 = pad_image(I1)
+def draw_debug_visual(frame, n, d, next_scene_change, frame_type):
+    """
+    Draw debug visualization with shape-based indicators
+    frame_type: 'interp', 'source', or 'copy'
+    """
+    h, w = frame.shape[:2]
+    
+    # Visual parameters
+    color = (0, 255, 0)  # Green for all
+    thickness = 2
+    font = cv2.FONT_HERSHEY_MONOSPACE
+    font_scale = 1.5
+    font_thickness = 2
+    margin = 30
+    timeline_w = 400
+    timeline_y = 100
+    marker_size = 10  # Base size for markers
+    
+    # Position elements in top-right
+    x_start = w - timeline_w - margin
+    x_end = w - margin
+    
+    # Draw next scene change info
+    sc_text = f"Next SC: {next_scene_change}" if next_scene_change is not None else "No scene change"
+    cv2.putText(frame, sc_text, (x_start, timeline_y + 45), 
+                font, font_scale*0.8, (0, 200, 255), font_thickness)
+    
+    # Draw timeline base
+    cv2.line(frame, (x_start, timeline_y), (x_end, timeline_y), (100, 100, 100), thickness)
+    
+    # Calculate current position
+    x_current = int(x_start + d * timeline_w)
+    label = f"{n+d:.2f}"
+    which_side = None
+    
+    # Draw current position marker with different shapes
+    if frame_type == 'interp':
+        # Circle for interpolated frames
+        cv2.circle(frame, (x_current, timeline_y), marker_size, color, -1)
+    elif frame_type == 'source':
+        # Square for source frames
+        top_left = (x_current - marker_size, timeline_y - marker_size)
+        bottom_right = (x_current + marker_size, timeline_y + marker_size)
+        cv2.rectangle(frame, top_left, bottom_right, color, -1)
+        which_side = 0 if d < 0.5 else 1
+    else:  # copy
+        # Triangle for copied frames
+        pts = np.array([
+            [x_current, timeline_y - marker_size],  # Top point
+            [x_current - marker_size, timeline_y + marker_size],  # Bottom left
+            [x_current + marker_size, timeline_y + marker_size]  # Bottom right
+        ], dtype=np.int32)
+        cv2.fillPoly(frame, [pts], color)
+    
+    # Draw label above current position
+    text_size = cv2.getTextSize(label, font, font_scale*0.9, font_thickness)[0]
+    text_x = x_current - text_size[0] // 2
+    cv2.putText(frame, label, (text_x, timeline_y - 20), 
+                font, font_scale*0.9, color, font_thickness)
+    if which_side != 0:
+        cv2.circle(frame, (x_start, timeline_y), marker_size, (200, 200, 200), thickness)
+        cv2.putText(frame, f"{n}", (x_start-15, timeline_y-20), 
+                    font, font_scale*0.9, (200, 200, 200), font_thickness)
+    elif which_side != 1:
+        cv2.circle(frame, (x_end, timeline_y), marker_size, (200, 200, 200), thickness)
+        cv2.putText(frame, f"{n+1}", (x_end-25, timeline_y-20), 
+            font, font_scale*0.9, (200, 200, 200), font_thickness)
 
-    output = []
-    close_enough = 0.0001
+while True:
+    next_scene_change = None
+    if scene_changes:
+        # Find smallest scene change >= current n
+        future_changes = [sc for sc in scene_changes if sc >= n]
+        if future_changes:
+            next_scene_change = min(future_changes)
+    
+    output_with_meta = []  # Store frame, d_val, and frame type
     while time + timestep <= n + 1 + close_enough:
+        d_val = time - n
+        
         if (n + 1) in scene_changes:
-            output.append(I0)
+            res = I0
+            frame_type = 'copy'
         else:
-            assert model.version >= 3.9
-            d = time - n
-            if d < close_enough:
+            if d_val < close_enough:
                 res = I0
-            elif d > 1 - close_enough:
+                frame_type = 'source'
+            elif d_val > 1 - close_enough:
                 res = I1
+                frame_type = 'source'
             else:
-                res = model.inference(I0, I1, d, scale)
-            output.append(res)
+                res = model.inference(I0, I1, d_val, scale)
+                frame_type = 'interp'
+        
+        output_with_meta.append((res, d_val, frame_type))
         time += timestep
 
-    for mid in output:
-        mid = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
-        write_buffer.put(mid[:h, :w])
+    for res, d_val, frame_type in output_with_meta:
+        mid = ((res[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0))
+        cropped = mid[:h, :w]
+        
+        # Add debug visualization
+        if args.debug:
+            draw_debug_visual(cropped, n, d_val, next_scene_change, frame_type)
+        
+        write_buffer.put(cropped)
+    
     pbar.update(1)
     n += 1
     lastframe = frame
