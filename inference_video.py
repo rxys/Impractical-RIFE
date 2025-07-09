@@ -193,7 +193,7 @@ def draw_debug_visual(frame, n, d, frame_type):
     font = cv2.FONT_HERSHEY_DUPLEX
     font_scale = 1.5
     font_thickness = 2
-    margin = 80
+    margin = 200
     timeline_w = 400
     timeline_y = 100
     marker_size = 10  # Base size for markers
@@ -239,7 +239,9 @@ def draw_debug_visual(frame, n, d, frame_type):
     text_x = x_current - text_size[0] // 2
     cv2.putText(frame, label, (text_x, timeline_y - 20), 
                 font, font_scale*0.9, color, font_thickness)
-    if which_side != 0:
+    if which_side is None:
+        pass
+    elif which_side != 0:
         cv2.circle(frame, (x_start, timeline_y), marker_size, (200, 200, 200), thickness)
         cv2.putText(frame, f"{n}", (x_start-15, timeline_y-20), 
                     font, font_scale*0.9, (200, 200, 200), font_thickness)
