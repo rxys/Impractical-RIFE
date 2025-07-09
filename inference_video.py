@@ -189,7 +189,7 @@ def draw_debug_visual(frame, n, d, frame_type):
     # Visual parameters
     color = (0, 255, 0)  # Green for all
     thickness = 2
-    font = cv2.FONT_HERSHEY_MONOSPACE
+    font = cv2.FONT_HERSHEY_DUPLEX
     font_scale = 1.5
     font_thickness = 2
     margin = 30
