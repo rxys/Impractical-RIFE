@@ -248,6 +248,7 @@ while True:
             next_scene_change = min(future_changes)
     
     output_with_meta = []  # Store frame, d_val, and frame type
+    close_enough = 0.0001
     while time + timestep <= n + 1 + close_enough:
         d_val = time - n
         
