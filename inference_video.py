@@ -177,6 +177,7 @@ def draw_debug_visual(frame, n, d, frame_type):
     frame_type: 'interp', 'source', or 'copy'
     """
     
+    frame = np.ascontiguousarray(frame)
     h, w = frame.shape[:2]
 
     next_scene_change = None
@@ -246,6 +247,7 @@ def draw_debug_visual(frame, n, d, frame_type):
         cv2.circle(frame, (x_end, timeline_y), marker_size, (200, 200, 200), thickness)
         cv2.putText(frame, f"{n+1}", (x_end-25, timeline_y-20), 
             font, font_scale*0.9, (200, 200, 200), font_thickness)
+    return frame
 
 while True:
     if temp is not None:
@@ -287,7 +289,7 @@ while True:
         
         # Add debug visualization
         if args.debug:
-            draw_debug_visual(cropped, n, d, frame_type)
+            cropped = draw_debug_visual(cropped, n, d, frame_type)
         
         write_buffer.put(cropped)
     
