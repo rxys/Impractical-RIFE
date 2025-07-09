@@ -171,12 +171,20 @@ temp = None # save lastframe when processing static frame
 time = 0
 n = 0
 
-def draw_debug_visual(frame, n, d, next_scene_change, frame_type):
+def draw_debug_visual(frame, n, d, frame_type):
     """
     Draw debug visualization with shape-based indicators
     frame_type: 'interp', 'source', or 'copy'
     """
+    
     h, w = frame.shape[:2]
+
+    next_scene_change = None
+    if scene_changes:
+        # Find smallest scene change >= current n
+        future_changes = [sc for sc in scene_changes if sc >= n]
+        if future_changes:
+            next_scene_change = min(future_changes)
     
     # Visual parameters
     color = (0, 255, 0)  # Green for all
@@ -240,42 +248,46 @@ def draw_debug_visual(frame, n, d, next_scene_change, frame_type):
             font, font_scale*0.9, (200, 200, 200), font_thickness)
 
 while True:
-    next_scene_change = None
-    if scene_changes:
-        # Find smallest scene change >= current n
-        future_changes = [sc for sc in scene_changes if sc >= n]
-        if future_changes:
-            next_scene_change = min(future_changes)
+    if temp is not None:
+        frame = temp
+        temp = None
+    else:
+        frame = read_buffer.get()
+    if frame is None:
+        break
+    I0 = I1
+    I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+    I1 = pad_image(I1)
     
-    output_with_meta = []  # Store frame, d_val, and frame type
+    output = []
     close_enough = 0.0001
     while time + timestep <= n + 1 + close_enough:
-        d_val = time - n
+        d = time - n
         
         if (n + 1) in scene_changes:
             res = I0
             frame_type = 'copy'
         else:
-            if d_val < close_enough:
+            if d < close_enough:
                 res = I0
                 frame_type = 'source'
-            elif d_val > 1 - close_enough:
+            elif d > 1 - close_enough:
                 res = I1
                 frame_type = 'source'
             else:
-                res = model.inference(I0, I1, d_val, scale)
+                res = model.inference(I0, I1, d, scale)
                 frame_type = 'interp'
         
-        output_with_meta.append((res, d_val, frame_type))
+        output.append((res, d, frame_type))
         time += timestep
 
-    for res, d_val, frame_type in output_with_meta:
+    for res, d, frame_type in output:
         mid = ((res[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0))
         cropped = mid[:h, :w]
         
         # Add debug visualization
         if args.debug:
-            draw_debug_visual(cropped, n, d_val, next_scene_change, frame_type)
+            draw_debug_visual(cropped, n, d, frame_type)
         
         write_buffer.put(cropped)
     
