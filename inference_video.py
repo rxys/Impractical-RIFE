@@ -41,11 +41,14 @@ def forward_monkey(self, x, timestep=0.5, scale_list=[16, 8, 4, 2, 1], training=
     # Extrapolation for timestep > 1
     if not training and isinstance(timestep, float) and timestep > 1.0:
         # Step 1: Get flow from img0 to img1 (at timestep=1)
-        flow_list, _, merged = self.forward(x, timestep=1.0, scale_list=scale_list, training=False, fastmode=True, ensemble=False)
+        flow_list, _, merged = self.forward(x, timestep=0.001, scale_list=scale_list, training=False, fastmode=True, ensemble=False)
         
         # Step 2: Compute scaled flow for timestep > 1
-        flow_0_to_1 = flow_list[-1][:, :2]  # Final flow from img0 to img1
-        flow_extrapolate = (timestep - 1.0) * flow_0_to_1
+        # 1) get the net’s B→A flow
+        flow_1_to_0 = flow_list[-1][:, 2:4]
+
+        # 2) invert
+        flow_extrapolate = - (timestep - 1.0) * flow_1_to_0
         
         # Step 3: Warp img1 using scaled flow
         extrapolated_frame = warp(img1, flow_extrapolate)
