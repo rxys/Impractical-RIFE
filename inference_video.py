@@ -110,13 +110,16 @@ if args.png:
     if not os.path.exists('vid_out'):
         os.mkdir('vid_out')
 else:
+    max_bpp = 0.227  # Targeted to match 50 Mbps at 1440p60
+    maxrate = int(max_bpp * w * h * args.fps)
+    gop = fps * 2
     output_params = {
         "-input_framerate": args.fps,
         "-vcodec": "h264_nvenc",
         "-rc": "vbr",
         "-cq": "24",
-        "-maxrate": "50M",
-        "-bufsize": "100M",          # 2x maxrate
+        "-maxrate": f"{maxrate // 1_000_000}M",
+        "-bufsize": f"{(maxrate * 2) // 1_000_000}M", # 2x maxrate
         "-preset": "p5",
         "-rc-lookahead": "48",
         "-spatial_aq": "1",
@@ -124,7 +127,7 @@ else:
         "-aq-strength": "10",
         "-bf": "3",
         "-refs": "4",
-        "-g": "120",
+        "-g": gop,
         "-profile:v": "high",
         "-pix_fmt": "yuv420p",
         "-b:v": "0",
