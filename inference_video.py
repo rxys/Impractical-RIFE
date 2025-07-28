@@ -32,14 +32,14 @@ args = parser.parse_args()
 
 from model.warplayer import warp
 
-def forward_monkey(self, x, timestep=0.5, scale_list=[8, 4, 2, 1], training=False, fastmode=True, ensemble=False):
+def forward_monkey(self, x, timestep=0.5, scale_list=[16, 8, 4, 2, 1], training=False, fastmode=True, ensemble=False):
     if training == False:
         channel = x.shape[1] // 2
         img0 = x[:, :channel]
         img1 = x[:, channel:]
 
     # Extrapolation for timestep > 1
-    if not training and (isinstance(timestep, float) and timestep > 1.0:
+    if not training and isinstance(timestep, float) and timestep > 1.0:
         # Step 1: Get flow from img0 to img1 (at timestep=1)
         flow_list, _, _ = self.forward(x, timestep=1.0, scale_list=scale_list, training=False, fastmode=True, ensemble=False)
         
