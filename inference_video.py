@@ -170,7 +170,6 @@ if args.png:
 else:
     max_bpp = 0.227  # Targeted to match 50 Mbps at 1440p60
     maxrate = int(max_bpp * w * h * args.fps)
-    gop = fps * 2
     output_params = {
         "-input_framerate": args.fps,
         "-vcodec": "h264_nvenc",
@@ -185,7 +184,7 @@ else:
         "-aq-strength": "10",
         "-bf": "3",
         "-refs": "4",
-        "-g": gop,
+        "-g": args.fps * 2,
         "-profile:v": "high",
         "-pix_fmt": "yuv420p",
         "-b:v": "0",
