@@ -30,6 +30,8 @@ parser.add_argument('--debug', dest='debug', action='store_true', help='Enable d
 
 args = parser.parse_args()
 
+from model.warplayer import warp
+
 def forward_monkey(self, x, timestep=0.5, scale_list=[8, 4, 2, 1], training=False, fastmode=True, ensemble=False):
     if training == False:
         channel = x.shape[1] // 2
