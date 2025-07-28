@@ -37,6 +37,23 @@ def forward_monkey(self, x, timestep=0.5, scale_list=[8, 4, 2, 1], training=Fals
         channel = x.shape[1] // 2
         img0 = x[:, :channel]
         img1 = x[:, channel:]
+
+    # Extrapolation for timestep > 1
+    if not training and (isinstance(timestep, float) and timestep > 1.0:
+        # Step 1: Get flow from img0 to img1 (at timestep=1)
+        flow_list, _, _ = self.forward(x, timestep=1.0, scale_list=scale_list, training=False, fastmode=True, ensemble=False)
+        
+        # Step 2: Compute scaled flow for timestep > 1
+        flow_0_to_1 = flow_list[-1][:, :2]  # Final flow from img0 to img1
+        flow_extrapolate = (timestep - 1.0) * flow_0_to_1
+        
+        # Step 3: Warp img1 using scaled flow
+        extrapolated_frame = warp(img1, flow_extrapolate)
+        
+        # Replace last merged entry with extrapolated frame
+        merged[-1] = extrapolated_frame
+        return None, None, merged
+
     if not torch.is_tensor(timestep):
         timestep = (x[:, :1].clone() * 0 + 1) * timestep
     else:
