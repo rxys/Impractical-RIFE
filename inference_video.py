@@ -229,6 +229,17 @@ else:
             "-tune": "hq",
         }
 
+    if args.output is not None:
+        vid_out_name = args.output
+    else:
+        # Assuming args.multi exists or is derived from args.fps / source_fps
+        multi = int(args.fps / source_fps) if source_fps else 1 
+        vid_out_name = '{}_{}X_{}fps.{}'.format(video_path_wo_ext, multi, int(np.round(args.fps)), args.ext)
+        
+    print(f"Output Video Name: {vid_out_name}")
+    # Initialize WriteGear. This can fail if the codec is truly unavailable.
+    vid_out = WriteGear(output=vid_out_name, logging=True, **output_params)
+
 def clear_write_buffer(user_args, write_buffer):
     cnt = 0
     while True:
