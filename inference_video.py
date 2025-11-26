@@ -27,6 +27,7 @@ parser.add_argument('--ext', dest='ext', type=str, default='mp4', help='vid_out 
 parser.add_argument('--drop_input', dest='drop_input', type=int, default=1, help='Only keep every Nth input frame (1 = keep all, 2 = drop every other, etc.)')
 parser.add_argument('--fixed_height', type=int, default=None, help='Fixed vertical resolution for downscaling while keeping aspect ratio')
 parser.add_argument('--debug', dest='debug', action='store_true', help='Enable debug visualization')
+parser.add_argument('--av1', dest='use_av1', action='store_true', help='Use software AV1 encoding (libaom-av1) instead of h264_nvenc.')
 
 args = parser.parse_args()
 
@@ -188,35 +189,45 @@ if args.png:
     if not os.path.exists('vid_out'):
         os.mkdir('vid_out')
 else:
-    max_bpp = 0.227  # Targeted to match 50 Mbps at 1440p60
-    maxrate = int(max_bpp * w * h * args.fps)
-    output_params = {
-        "-input_framerate": args.fps,
-        "-vcodec": "h264_nvenc",
-        "-rc": "vbr",
-        "-cq": "24",
-        "-maxrate": f"{maxrate // 1_000_000}M",
-        "-bufsize": f"{(maxrate * 2) // 1_000_000}M", # 2x maxrate
-        "-preset": "p5",
-        "-rc-lookahead": "48",
-        "-spatial_aq": "1",
-        "-temporal_aq": "1",
-        "-aq-strength": "10",
-        "-bf": "3",
-        "-refs": "4",
-        "-g": args.fps * 2,
-        "-profile:v": "high",
-        "-pix_fmt": "yuv420p",
-        "-b:v": "0",
-        # Only if Turing/Ampere GPU:
-        "-tune": "hq",
-    }
-    
-    if args.output is not None:
-        vid_out_name = args.output
+    if args.use_av1:
+        print("Using software AV1 (libaom-av1) encoder for high quality output.")
+        # High quality, single-pass CRF settings for libaom-av1
+        output_params = {
+            "-input_framerate": args.fps,
+            "-vcodec": "libaom-av1",
+            "-crf": "24", # Target Constant Quality mode
+            "-cpu-used": "4", # Balance of speed and quality (Lower is slower/better)
+            "-row-mt": "1", # Enable row-based multithreading
+            "-pix_fmt": "yuv420p",
+            "-b:v": "0", # Ensures CRF mode
+            "-tune": "ssim", # Tune for structural similarity/visual quality
+        }
     else:
-        vid_out_name = '{}_{}X_{}fps.{}'.format(video_path_wo_ext, args.multi, int(np.round(args.fps)), args.ext)
-    vid_out = WriteGear(output=vid_out_name, logging=True, **output_params)
+        print("Using hardware H.264 (h264_nvenc).")
+        max_bpp = 0.227 
+        maxrate = int(max_bpp * w * h * args.fps)
+        
+        output_params = {
+            "-input_framerate": args.fps,
+            "-vcodec": "h264_nvenc",
+            "-rc": "vbr",
+            "-cq": "24",
+            "-maxrate": f"{maxrate // 1_000_000}M",
+            "-bufsize": f"{(maxrate * 2) // 1_000_000}M",
+            "-preset": "p5",
+            "-rc-lookahead": "48",
+            "-spatial_aq": "1",
+            "-temporal_aq": "1",
+            "-aq-strength": "10",
+            "-bf": "3",
+            "-refs": "4",
+            "-g": args.fps * 2,
+            "-profile:v": "high",
+            "-pix_fmt": "yuv420p",
+            "-b:v": "0",
+            # Only if Turing/Ampere GPU:
+            "-tune": "hq",
+        }
 
 def clear_write_buffer(user_args, write_buffer):
     cnt = 0
