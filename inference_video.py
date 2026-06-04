@@ -18,7 +18,12 @@ warnings.filterwarnings("ignore")
 
 parser = argparse.ArgumentParser(description='Interpolation for a pair of images')
 parser.add_argument('--video', dest='video', type=str, default=None, required=True)
-parser.add_argument('--scene_video', dest='scene_video', type=str, default=None, help='Low-res video specifically for scene detection')
+parser.add_argument('--scene_video', dest='scene_video', type=str, default=None, help='Low-res video specifically for ffmpeg scene detection')
+parser.add_argument('--scene_detector', dest='scene_detector', type=str, default='hash', choices=['hash', 'ffmpeg', 'none'], help='Scene detector to use. "hash" runs on the already decoded frames.')
+parser.add_argument('--scene_hash_threshold', dest='scene_hash_threshold', type=float, default=0.410, help='Normalized Hamming distance threshold for hash scene detection')
+parser.add_argument('--scene_hash_size', dest='scene_hash_size', type=int, default=16, help='Low-frequency DCT square size for hash scene detection')
+parser.add_argument('--scene_hash_lowpass', dest='scene_hash_lowpass', type=int, default=2, help='DCT lowpass factor for hash scene detection')
+parser.add_argument('--scene_min_len', dest='scene_min_len', type=float, default=0.5, help='Minimum seconds between scene cuts')
 parser.add_argument('--output', dest='output', type=str, default=None)
 parser.add_argument('--model', dest='modelDir', type=str, default='train_log', help='directory with trained model files')
 parser.add_argument('--fp16', dest='fp16', action='store_true', help='fp16 mode for faster and more lightweight inference on cards with Tensor Cores')
@@ -183,45 +188,120 @@ if args.fixed_height is not None:
     lastframe = cv2.resize(lastframe, (w, h), interpolation=cv2.INTER_AREA)
 print('{}.{}, {} frames in total, {}FPS to {}FPS'.format(video_path_wo_ext, args.ext, tot_frames, source_fps, args.fps))
 
-def detect_scenes():
+class HashSceneDetector:
+    def __init__(self, threshold, size, lowpass, min_scene_len_frames):
+        self.threshold = threshold
+        self.size = size
+        self.size_sq = float(size * size)
+        self.lowpass = lowpass
+        self.min_scene_len_frames = min_scene_len_frames
+        self.last_hash = None
+        self.last_scene_cut = 0
+        self.last_score = None
+
+    @staticmethod
+    def hash_frame(frame_img, hash_size, factor):
+        gray_img = cv2.cvtColor(frame_img, cv2.COLOR_BGR2GRAY)
+        imsize = hash_size * factor
+        resized_img = cv2.resize(gray_img, (imsize, imsize), interpolation=cv2.INTER_AREA)
+        max_value = np.max(resized_img)
+        if max_value == 0:
+            max_value = 1
+        resized_img = np.float32(resized_img) / max_value
+        dct_complete = cv2.dct(resized_img)
+        dct_low_freq = dct_complete[:hash_size, :hash_size]
+        med = np.median(np.asarray(dct_low_freq, dtype=np.float32))
+        return dct_low_freq > med
+
+    def process_frame(self, frame_img, frame_index):
+        curr_hash = self.hash_frame(frame_img, self.size, self.lowpass)
+        if self.last_hash is None:
+            self.last_hash = curr_hash
+            self.last_score = None
+            return False
+
+        hash_dist = np.count_nonzero(curr_hash != self.last_hash)
+        hash_dist_norm = hash_dist / self.size_sq
+        self.last_hash = curr_hash
+        self.last_score = hash_dist_norm
+
+        if (
+            hash_dist_norm >= self.threshold
+            and frame_index - self.last_scene_cut >= self.min_scene_len_frames
+        ):
+            self.last_scene_cut = frame_index
+            return True
+        return False
+
+def detect_scenes_ffmpeg():
     pattern = re.compile(
-        r"showinfo.*?\bn:\s*(\d+).*?\bpts:\s*(\d+)",
+        r"showinfo.*?\bn:\s*(\d+).*?\bpts:\s*(\d+).*?\bpts_time:\s*([0-9.]+)",
         re.IGNORECASE
     )
 
     def parse_showinfo(stderr):
-        # Match lines containing showinfo with 'n:' and 'pts_time:'
+        # Match lines containing showinfo with 'n:', 'pts:', and 'pts_time:'
         for line in stderr.splitlines():
             m = pattern.search(line)    
             if m:
                 n = int(m.group(1))
                 pts = int(m.group(2))
-                yield n, pts
+                pts_time = float(m.group(3))
+                yield n, pts, pts_time
 
     print("Running stupid 2-pass scene detection...")
 
     scene_vid = args.scene_video if args.scene_video else args.video
-    # 1st pass: full showinfo to map pts_time -> frame
+    # 1st pass: full showinfo to map pts -> frame
     out1 = subprocess.run(
         ["ffmpeg", "-i", scene_vid, "-vf", "showinfo", "-f", "null", "-", "-hide_banner"],
         stderr=subprocess.PIPE, text=True
     )
-    pts_to_frame = {pts: frame for frame, pts in parse_showinfo(out1.stderr)}
+    pts_to_frame = {pts: frame for frame, pts, _ in parse_showinfo(out1.stderr)}
 
     # 2nd pass: scene-detected pts_times
     out2 = subprocess.run(
-        ["ffmpeg", "-i", scene_vid, "-vf", "select='gt(scene,0.4)',showinfo", "-f", "null", "-", "-hide_banner"],
+        ["ffmpeg", "-i", scene_vid, "-vf", "select='gt(scene,0.15)',showinfo", "-f", "null", "-", "-hide_banner"],
         stderr=subprocess.PIPE, text=True
     )
-    scene_changes = {
-        math.ceil(pts_to_frame[pts] / args.drop_input)
-        for _, pts in parse_showinfo(out2.stderr)
-        if pts in pts_to_frame
-    }
+    
+    # Sort detected scenes by pts_time and debounce by 0.3s
+    raw_scenes = list(parse_showinfo(out2.stderr))
+    raw_scenes.sort(key=lambda x: x[2])  # sort by pts_time
+    
+    scene_changes = set()
+    last_t = -999.0
+    for _, pts, pts_time in raw_scenes:
+        if pts in pts_to_frame:
+            if pts_time - last_t >= 0.3:
+                scene_changes.add(math.ceil(pts_to_frame[pts] / args.drop_input))
+                last_t = pts_time
+
     return scene_changes
 
-scene_changes = detect_scenes()
-print(f"Detected {len(scene_changes)} scene changes via ffmpeg.\n{scene_changes}")
+scene_changes = set()
+live_scene_detector = None
+
+if args.scene_detector == 'ffmpeg':
+    scene_changes = detect_scenes_ffmpeg()
+    print(f"Detected {len(scene_changes)} scene changes via ffmpeg.\n{scene_changes}")
+elif args.scene_detector == 'hash':
+    min_scene_len_frames = max(1, int(round(args.scene_min_len * source_fps)))
+    live_scene_detector = HashSceneDetector(
+        threshold=args.scene_hash_threshold,
+        size=args.scene_hash_size,
+        lowpass=args.scene_hash_lowpass,
+        min_scene_len_frames=min_scene_len_frames,
+    )
+    live_scene_detector.process_frame(lastframe, 0)
+    hash_res = args.scene_hash_size * args.scene_hash_lowpass
+    print(
+        "Using live hash scene detection on decoded frames "
+        f"({hash_res}x{hash_res} DCT input, threshold={args.scene_hash_threshold}, "
+        f"min_gap={min_scene_len_frames} kept frames)."
+    )
+else:
+    print("Scene detection disabled.")
 
 vid_out_name = None
 vid_out = None
@@ -425,6 +505,8 @@ while True:
         frame = read_buffer.get()
     if frame is None:
         break
+    if live_scene_detector is not None and live_scene_detector.process_frame(frame, n + 1):
+        scene_changes.add(n + 1)
     Im1 = I0
     I0 = I1
     I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
@@ -477,5 +559,7 @@ import time
 while(not write_buffer.empty()):
     time.sleep(0.1)
 pbar.close()
+if live_scene_detector is not None:
+    print(f"Detected {len(scene_changes)} scene changes via live hash.\n{scene_changes}")
 if not vid_out is None:
     vid_out.close()
