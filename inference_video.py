@@ -28,6 +28,7 @@ parser.add_argument('--drop_input', dest='drop_input', type=int, default=1, help
 parser.add_argument('--fixed_height', type=int, default=None, help='Fixed vertical resolution for downscaling while keeping aspect ratio')
 parser.add_argument('--debug', dest='debug', action='store_true', help='Enable debug visualization')
 parser.add_argument('--av1', dest='use_av1', action='store_true', help='Use software AV1 encoding (libaom-av1) instead of h264_nvenc.')
+parser.add_argument('--out_chunks', dest='out_chunks', action='store_true', help='Output streamable chunks via segment muxer')
 
 args = parser.parse_args()
 
@@ -228,6 +229,11 @@ else:
             # Only if Turing/Ampere GPU:
             "-tune": "hq",
         }
+
+    if args.out_chunks:
+        output_params["-f"] = "segment"
+        output_params["-segment_time"] = "10"
+        output_params["-reset_timestamps"] = "1"
 
     if args.output is not None:
         vid_out_name = args.output
