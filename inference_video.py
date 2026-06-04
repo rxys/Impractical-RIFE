@@ -35,6 +35,41 @@ args = parser.parse_args()
 
 from model.warplayer import warp
 
+def forward_warp(img, flow):
+    B, C, H, W = img.shape
+    # Create meshgrid
+    grid_y, grid_x = torch.meshgrid(torch.arange(0, H, device=img.device), torch.arange(0, W, device=img.device), indexing='ij')
+    grid_x = grid_x.float().unsqueeze(0).expand(B, -1, -1)
+    grid_y = grid_y.float().unsqueeze(0).expand(B, -1, -1)
+    
+    # Add flow (from source to target)
+    new_x = grid_x + flow[:, 0, :, :]
+    new_y = grid_y + flow[:, 1, :, :]
+    
+    # Clamp to image boundaries
+    new_x = torch.clamp(new_x, 0, W - 1).long()
+    new_y = torch.clamp(new_y, 0, H - 1).long()
+    
+    # Compute 1D index for H * W
+    idx = new_y * W + new_x
+    idx = idx.view(B, 1, -1).expand(-1, C, -1)
+    
+    img_flat = img.view(B, C, -1)
+    out = torch.zeros_like(img_flat)
+    
+    # Scatter pixels to new positions
+    out.scatter_(2, idx, img_flat)
+    out = out.view(B, C, H, W)
+    
+    # Simple hole filling for 1-pixel holes
+    mask = torch.zeros(B, 1, H * W, device=img.device)
+    mask.scatter_(2, idx[:, 0:1, :], torch.ones_like(img_flat[:, 0:1, :]))
+    mask = mask.view(B, 1, H, W)
+    
+    filled = F.max_pool2d(out, kernel_size=3, stride=1, padding=1)
+    out = torch.where(mask > 0, out, filled)
+    return out
+
 def forward_monkey(self, x, timestep=0.5, scale_list=[16, 8, 4, 2, 1], training=False, fastmode=True, ensemble=False):
     if training == False:
         channel = x.shape[1] // 2
@@ -43,18 +78,20 @@ def forward_monkey(self, x, timestep=0.5, scale_list=[16, 8, 4, 2, 1], training=
 
     # Extrapolation for timestep > 1
     if not training and isinstance(timestep, float) and timestep > 1.0:
-        # Step 1: Get flow from img0 to img1 (at timestep=1)
-        flow_list, _, merged = self.forward(x, timestep=0.001, scale_list=scale_list, training=False, fastmode=True, ensemble=False)
+        # Step 1: Get flow ALIGNED WITH img1 by using timestep=0.999
+        # This makes the intermediate frame essentially img1
+        flow_list, _, merged = self.forward(x, timestep=0.999, scale_list=scale_list, training=False, fastmode=True, ensemble=False)
         
-        # Step 2: Compute scaled flow for timestep > 1
-        # 1) get the net’s B→A flow
-        flow_1_to_0 = flow_list[-1][:, 2:4]
+        # Step 2: Extract backward flow from img1 to img0
+        # flow[:, :2] is flow from intermediate (img1) to img0
+        flow_1_to_0 = flow_list[-1][:, :2]
 
-        # 2) invert
-        flow_extrapolate = - (timestep - 1.0) * flow_1_to_0
+        # Forward velocity from img1 to future is the inverse of flow_1_to_0
+        velocity = -flow_1_to_0
         
-        # Step 3: Warp img1 using scaled flow
-        extrapolated_frame = warp(img1, flow_extrapolate)
+        # Step 3: Forward warp img1 by d * velocity
+        d = timestep - 1.0
+        extrapolated_frame = forward_warp(img1, d * velocity)
         
         # Replace last merged entry with extrapolated frame
         merged[-1] = extrapolated_frame
