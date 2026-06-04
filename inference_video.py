@@ -18,6 +18,7 @@ warnings.filterwarnings("ignore")
 
 parser = argparse.ArgumentParser(description='Interpolation for a pair of images')
 parser.add_argument('--video', dest='video', type=str, default=None, required=True)
+parser.add_argument('--scene_video', dest='scene_video', type=str, default=None, help='Low-res video specifically for scene detection')
 parser.add_argument('--output', dest='output', type=str, default=None)
 parser.add_argument('--model', dest='modelDir', type=str, default='train_log', help='directory with trained model files')
 parser.add_argument('--fp16', dest='fp16', action='store_true', help='fp16 mode for faster and more lightweight inference on cards with Tensor Cores')
@@ -162,16 +163,17 @@ def detect_scenes():
 
     print("Running stupid 2-pass scene detection...")
 
+    scene_vid = args.scene_video if args.scene_video else args.video
     # 1st pass: full showinfo to map pts_time -> frame
     out1 = subprocess.run(
-        ["ffmpeg", "-i", args.video, "-vf", "showinfo", "-f", "null", "-", "-hide_banner"],
+        ["ffmpeg", "-i", scene_vid, "-vf", "showinfo", "-f", "null", "-", "-hide_banner"],
         stderr=subprocess.PIPE, text=True
     )
     pts_to_frame = {pts: frame for frame, pts in parse_showinfo(out1.stderr)}
 
     # 2nd pass: scene-detected pts_times
     out2 = subprocess.run(
-        ["ffmpeg", "-i", args.video, "-vf", "select='gt(scene,0.4)',showinfo", "-f", "null", "-", "-hide_banner"],
+        ["ffmpeg", "-i", scene_vid, "-vf", "select='gt(scene,0.4)',showinfo", "-f", "null", "-", "-hide_banner"],
         stderr=subprocess.PIPE, text=True
     )
     scene_changes = {
