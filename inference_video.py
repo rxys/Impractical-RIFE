@@ -1,3 +1,4 @@
+from model.loss import img1
 import re
 import os
 import cv2
@@ -41,39 +42,75 @@ args = parser.parse_args()
 from model.warplayer import warp
 
 def forward_warp(img, flow):
+    """
+    Bilinear normalized forward splat.
+
+    img:  [B, C, H, W]
+    flow: [B, 2, H, W], source -> destination displacement in pixels
+    """
     B, C, H, W = img.shape
-    # Create meshgrid
-    grid_y, grid_x = torch.meshgrid(torch.arange(0, H, device=img.device), torch.arange(0, W, device=img.device), indexing='ij')
-    grid_x = grid_x.float().unsqueeze(0).expand(B, -1, -1)
-    grid_y = grid_y.float().unsqueeze(0).expand(B, -1, -1)
-    
-    # Add flow (from source to target)
-    new_x = grid_x + flow[:, 0, :, :]
-    new_y = grid_y + flow[:, 1, :, :]
-    
-    # Clamp to image boundaries
-    new_x = torch.clamp(new_x, 0, W - 1).long()
-    new_y = torch.clamp(new_y, 0, H - 1).long()
-    
-    # Compute 1D index for H * W
-    idx = new_y * W + new_x
-    idx = idx.view(B, 1, -1).expand(-1, C, -1)
-    
-    img_flat = img.view(B, C, -1)
-    out = torch.zeros_like(img_flat)
-    
-    # Scatter pixels to new positions
-    out.scatter_(2, idx, img_flat)
-    out = out.view(B, C, H, W)
-    
-    # Simple hole filling for 1-pixel holes
-    mask = torch.zeros(B, 1, H * W, device=img.device)
-    mask.scatter_(2, idx[:, 0:1, :], torch.ones_like(img_flat[:, 0:1, :]))
-    mask = mask.view(B, 1, H, W)
-    
-    filled = F.max_pool2d(out, kernel_size=3, stride=1, padding=1)
-    out = torch.where(mask > 0, out, filled)
-    return out
+
+    # Use FP32 for coordinates and accumulation, even during FP16 inference.
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=img.device, dtype=torch.float32),
+        torch.arange(W, device=img.device, dtype=torch.float32),
+        indexing="ij",
+    )
+
+    tx = xx.unsqueeze(0) + flow[:, 0].float()
+    ty = yy.unsqueeze(0) + flow[:, 1].float()
+
+    x0 = torch.floor(tx)
+    y0 = torch.floor(ty)
+    x1 = x0 + 1.0
+    y1 = y0 + 1.0
+
+    src = img.float().reshape(B, C, -1)
+    accum = torch.zeros(
+        B, C, H * W, device=img.device, dtype=torch.float32
+    )
+    weight_sum = torch.zeros(
+        B, 1, H * W, device=img.device, dtype=torch.float32
+    )
+
+    def splat(x, y, weight):
+        valid = (
+            (x >= 0) & (x < W) &
+            (y >= 0) & (y < H)
+        )
+
+        # Clamp only to produce safe indices. Invalid contributions get zero weight.
+        xi = x.clamp(0, W - 1).long()
+        yi = y.clamp(0, H - 1).long()
+
+        idx = (yi * W + xi).reshape(B, 1, -1)
+        wgt = (
+            weight * valid.to(weight.dtype)
+        ).reshape(B, 1, -1)
+
+        accum.scatter_add_(
+            2,
+            idx.expand(-1, C, -1),
+            src * wgt,
+        )
+        weight_sum.scatter_add_(2, idx, wgt)
+
+    splat(x0, y0, (x1 - tx) * (y1 - ty))
+    splat(x1, y0, (tx - x0) * (y1 - ty))
+    splat(x0, y1, (x1 - tx) * (ty - y0))
+    splat(x1, y1, (tx - x0) * (ty - y0))
+
+    accum = accum.reshape(B, C, H, W)
+    weight_sum = weight_sum.reshape(B, 1, H, W)
+
+    result = accum / weight_sum.clamp_min(1e-6)
+    result = result.to(img.dtype)
+
+    # Approximate inverse warp for newly exposed holes.
+    fallback = warp(img, -flow.to(img.dtype))
+
+    return torch.where(weight_sum > 1e-6, result, fallback)
+
 
 def forward_monkey(self, x, timestep=0.5, scale_list=[16, 8, 4, 2, 1], training=False, fastmode=True, ensemble=False):
     if training == False:
@@ -83,22 +120,33 @@ def forward_monkey(self, x, timestep=0.5, scale_list=[16, 8, 4, 2, 1], training=
 
     # Extrapolation for timestep > 1
     if not training and isinstance(timestep, float) and timestep > 1.0:
-        # Step 1: Get flow ALIGNED WITH img1 by using timestep=0.999
-        # This makes the intermediate frame essentially img1
-        flow_list, _, merged = self.forward(x, timestep=0.999, scale_list=scale_list, training=False, fastmode=True, ensemble=False)
-        
-        # Step 2: Extract backward flow from img1 to img0
-        # flow[:, :2] is flow from intermediate (img1) to img0
-        flow_1_to_0 = flow_list[-1][:, :2]
+        # Midpoint gives two useful, reasonably balanced intermediate flows.
+        flow_list, _, merged = self.forward(
+            x,
+            timestep=0.5,
+            scale_list=scale_list,
+            training=False,
+            fastmode=True,
+            ensemble=False,
+        )
 
-        # Forward velocity from img1 to future is the inverse of flow_1_to_0
-        velocity = -flow_1_to_0
-        
-        # Step 3: Forward warp img1 by d * velocity
+        flow_mid = flow_list[-1]
+
+        # These are midpoint -> img0 and midpoint -> img1 sampling vectors.
+        mid_to_0 = flow_mid[:, :2]
+        mid_to_1 = flow_mid[:, 2:4]
+
+        # Under constant motion:
+        # mid_to_0 = -0.5 * velocity
+        # mid_to_1 = +0.5 * velocity
+        velocity_mid = mid_to_1 - mid_to_0
+
+        # Relocate the velocity field from midpoint coordinates onto img1.
+        velocity_at_img1 = forward_warp(velocity_mid, mid_to_1)
+
         d = timestep - 1.0
-        extrapolated_frame = forward_warp(img1, d * velocity)
-        
-        # Replace last merged entry with extrapolated frame
+        extrapolated_frame = forward_warp(img1, d * velocity_at_img1)
+
         merged[-1] = extrapolated_frame
         return None, None, merged
 
