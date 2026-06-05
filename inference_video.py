@@ -1,4 +1,3 @@
-from model.loss import img1
 import re
 import os
 import cv2
