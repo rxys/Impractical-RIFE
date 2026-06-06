@@ -35,6 +35,7 @@ parser.add_argument('--fixed_height', type=int, default=None, help='Fixed vertic
 parser.add_argument('--debug', dest='debug', action='store_true', help='Enable debug visualization')
 parser.add_argument('--av1', dest='use_av1', action='store_true', help='Use software AV1 encoding (libaom-av1) instead of h264_nvenc.')
 parser.add_argument('--out_chunks', dest='out_chunks', action='store_true', help='Output streamable chunks via segment muxer')
+parser.add_argument('--dedup', dest='dedup', type=float, nargs='?', const=0.5, default=0.0, help='Threshold for duplicate frame detection (e.g. 0.1-1.5). 0.0 means disabled.')
 
 args = parser.parse_args()
 
@@ -425,9 +426,14 @@ def clear_write_buffer(user_args, write_buffer):
             vid_out.write(item)  # Write the frame using VidGear
             cnt += 1
 
-def build_read_buffer(user_args, read_buffer, videogen):
+def build_read_buffer(user_args, read_buffer, videogen, lastframe):
     try:
-        frame_index = 0
+        frame_index = 1
+        last_kept_small = None
+        if user_args.dedup > 0 and lastframe is not None:
+            gray = cv2.cvtColor(lastframe, cv2.COLOR_BGR2GRAY)
+            last_kept_small = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
+
         while True:
             frame = videogen.read()
             if frame is None:
@@ -435,7 +441,19 @@ def build_read_buffer(user_args, read_buffer, videogen):
             if args.fixed_height is not None:
                 frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
             if frame_index % user_args.drop_input == 0:
-                read_buffer.put(frame)
+                is_dup = False
+                if user_args.dedup > 0:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    small = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
+                    if last_kept_small is not None:
+                        mad = np.mean(np.abs(small.astype(np.float32) - last_kept_small.astype(np.float32)))
+                        if mad < user_args.dedup:
+                            is_dup = True
+                    if not is_dup:
+                        last_kept_small = small
+                
+                if not is_dup:
+                    read_buffer.put((frame, frame_index))
             frame_index += 1
     except:
         pass
@@ -456,7 +474,7 @@ padding = (0, pw - w, 0, ph - h)
 pbar = tqdm(total=tot_frames)
 write_buffer = Queue(maxsize=125)
 read_buffer = Queue(maxsize=125)
-_thread.start_new_thread(build_read_buffer, (args, read_buffer, videogen))
+_thread.start_new_thread(build_read_buffer, (args, read_buffer, videogen, lastframe))
 _thread.start_new_thread(clear_write_buffer, (args, write_buffer))
 
 I0 = None
@@ -465,8 +483,11 @@ I1 = pad_image(I1)
 temp = None # save lastframe when processing static frame
 time = 0
 n = 0
+idx0 = None
+idx1 = 0
+idx_m1 = None
 
-def draw_debug_visual(frame, n, d, frame_type):
+def draw_debug_visual(frame, idx0, idx1, d, frame_type):
     """
     Draw debug visualization with shape-based indicators
     frame_type: 'interp', 'source', or 'copy'
@@ -477,8 +498,8 @@ def draw_debug_visual(frame, n, d, frame_type):
 
     next_scene_change = None
     if scene_changes:
-        # Find smallest scene change >= current n
-        future_changes = [sc for sc in scene_changes if sc >= n]
+        # Find smallest scene change >= current idx0
+        future_changes = [sc for sc in scene_changes if sc >= idx0]
         if future_changes:
             next_scene_change = min(future_changes)
     
@@ -507,7 +528,7 @@ def draw_debug_visual(frame, n, d, frame_type):
     
     # Calculate current position
     x_current = int(x_start + d * timeline_w)
-    label = f"{n+d:.2f}"
+    label = f"{idx0 + d * (idx1 - idx0):.2f}"
     which_side = None
     
     # Draw current position marker with different shapes
@@ -520,8 +541,8 @@ def draw_debug_visual(frame, n, d, frame_type):
         bottom_right = (x_current + marker_size, timeline_y + marker_size)
         cv2.rectangle(frame, top_left, bottom_right, color, -1)
         which_side = 0 if d < 0.5 else 1
-    else:  # copy
-        # Triangle for copied frames
+    else:  # copy or extra
+        # Triangle for copied or extrapolated frames
         pts = np.array([
             [x_current, timeline_y - marker_size],  # Top point
             [x_current - marker_size, timeline_y + marker_size],  # Bottom left
@@ -536,40 +557,48 @@ def draw_debug_visual(frame, n, d, frame_type):
                 font, font_scale*0.9, color, font_thickness)
     if which_side != 0:
         cv2.circle(frame, (x_start, timeline_y), marker_size, (200, 200, 200), thickness)
-        cv2.putText(frame, f"{n}", (x_start-15, timeline_y-20), 
+        cv2.putText(frame, f"{idx0}", (x_start-15, timeline_y-20), 
                     font, font_scale*0.9, (200, 200, 200), font_thickness)
     if which_side != 1:
         cv2.circle(frame, (x_end, timeline_y), marker_size, (200, 200, 200), thickness)
-        cv2.putText(frame, f"{n+1}", (x_end-25, timeline_y-20), 
+        cv2.putText(frame, f"{idx1}", (x_end-25, timeline_y-20), 
             font, font_scale*0.9, (200, 200, 200), font_thickness)
     return frame
 
 while True:
     if temp is not None:
-        frame = temp
+        frame, frame_idx = temp
         temp = None
     else:
-        frame = read_buffer.get()
-    if frame is None:
-        break
-    if live_scene_detector is not None and live_scene_detector.process_frame(frame, n + 1):
-        scene_changes.add(n + 1)
+        item = read_buffer.get()
+        if item is None:
+            break
+        frame, frame_idx = item
+    if live_scene_detector is not None and live_scene_detector.process_frame(frame, frame_idx):
+        scene_changes.add(frame_idx)
     Im1 = I0
     I0 = I1
     I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
     I1 = pad_image(I1)
     
+    idx_m1 = idx0
+    idx0 = idx1
+    idx1 = frame_idx
+    
     output = []
     close_enough = 0.0001
-    while time <= n + 1 + close_enough:
-        d = time - n
+    while time <= idx1 + close_enough:
+        gap = idx1 - idx0
+        d = (time - idx0) / gap if gap > 0 else 0.0
         
-        if (n + 1) in scene_changes:
+        if idx1 in scene_changes:
             if Im1 is None:
                 res = I0
                 frame_type = 'copy'
             else:
-                res = model.inference(Im1, I0, 1.0 + d, scale)
+                gap_prev = idx0 - idx_m1
+                extrap_factor = (time - idx_m1) / gap_prev if gap_prev > 0 else 1.0 + d
+                res = model.inference(Im1, I0, extrap_factor, scale)
                 frame_type = 'extra'
         else:
             if d < close_enough:
@@ -591,11 +620,11 @@ while True:
         
         # Add debug visualization
         if args.debug:
-            cropped = draw_debug_visual(cropped, n, d, frame_type)
+            cropped = draw_debug_visual(cropped, idx0, idx1, d, frame_type)
         
         write_buffer.put(cropped)
     
-    pbar.update(1)
+    pbar.update(idx1 - idx0)
     n += 1
     lastframe = frame
 
