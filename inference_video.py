@@ -35,6 +35,8 @@ parser.add_argument('--fixed_height', type=int, default=None, help='Fixed vertic
 parser.add_argument('--debug', dest='debug', action='store_true', help='Enable debug visualization')
 parser.add_argument('--av1', dest='use_av1', action='store_true', help='Use software AV1 encoding (libaom-av1) instead of h264_nvenc.')
 parser.add_argument('--out_chunks', dest='out_chunks', action='store_true', help='Output streamable chunks via segment muxer')
+parser.add_argument('--dedup', dest='dedup', action='store_true', help='Detect and discard near-duplicate frames before interpolation (streaming single-pass)')
+parser.add_argument('--dedup_threshold', dest='dedup_threshold', type=float, default=0.02, help='Normalized hash distance below which frames are considered duplicates (lower = stricter)')
 
 args = parser.parse_args()
 
@@ -466,6 +468,12 @@ temp = None # save lastframe when processing static frame
 time = 0
 n = 0
 
+# Dedup state: hash of the last unique frame, reuses HashSceneDetector's DCT hash
+dedup_hash_size = 16
+dedup_hash_lowpass = 2
+dedup_last_hash = HashSceneDetector.hash_frame(lastframe, dedup_hash_size, dedup_hash_lowpass) if args.dedup else None
+dedup_skipped = 0
+
 def draw_debug_visual(frame, n, d, frame_type):
     """
     Draw debug visualization with shape-based indicators
@@ -554,6 +562,19 @@ while True:
         break
     if live_scene_detector is not None and live_scene_detector.process_frame(frame, n + 1):
         scene_changes.add(n + 1)
+
+    # Streaming dedup: skip near-duplicate frames, let interpolation fill the gap
+    if args.dedup:
+        curr_hash = HashSceneDetector.hash_frame(frame, dedup_hash_size, dedup_hash_lowpass)
+        hash_dist = np.count_nonzero(curr_hash != dedup_last_hash) / float(dedup_hash_size ** 2)
+        if hash_dist < args.dedup_threshold:
+            # Duplicate — skip this frame entirely
+            dedup_skipped += 1
+            pbar.update(1)
+            n += 1
+            lastframe = frame
+            continue
+        dedup_last_hash = curr_hash
     Im1 = I0
     I0 = I1
     I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
@@ -606,6 +627,8 @@ import time
 while(not write_buffer.empty()):
     time.sleep(0.1)
 pbar.close()
+if args.dedup:
+    print(f"Dedup: skipped {dedup_skipped} duplicate frames out of {n + dedup_skipped} total.")
 if live_scene_detector is not None:
     print(f"Detected {len(scene_changes)} scene changes via live hash.\n{scene_changes}")
 if not vid_out is None:
