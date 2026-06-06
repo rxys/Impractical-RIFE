@@ -35,6 +35,7 @@ parser.add_argument('--fixed_height', type=int, default=None, help='Fixed vertic
 parser.add_argument('--debug', dest='debug', action='store_true', help='Enable debug visualization')
 parser.add_argument('--av1', dest='use_av1', action='store_true', help='Use software AV1 encoding (libaom-av1) instead of h264_nvenc.')
 parser.add_argument('--out_chunks', dest='out_chunks', action='store_true', help='Output streamable chunks via segment muxer')
+parser.add_argument('--dedup', dest='dedup', action='store_true', help='Drop duplicate frames before interpolation to restore smooth motion')
 
 args = parser.parse_args()
 
@@ -465,8 +466,10 @@ I1 = pad_image(I1)
 temp = None # save lastframe when processing static frame
 time = 0
 n = 0
+n0 = 0
+last_unique_frame_np = lastframe
 
-def draw_debug_visual(frame, n, d, frame_type):
+def draw_debug_visual(frame, n0, n1, d, time_val, frame_type):
     """
     Draw debug visualization with shape-based indicators
     frame_type: 'interp', 'source', or 'copy'
@@ -477,8 +480,8 @@ def draw_debug_visual(frame, n, d, frame_type):
 
     next_scene_change = None
     if scene_changes:
-        # Find smallest scene change >= current n
-        future_changes = [sc for sc in scene_changes if sc >= n]
+        # Find smallest scene change >= current n1
+        future_changes = [sc for sc in scene_changes if sc >= n1]
         if future_changes:
             next_scene_change = min(future_changes)
     
@@ -507,7 +510,7 @@ def draw_debug_visual(frame, n, d, frame_type):
     
     # Calculate current position
     x_current = int(x_start + d * timeline_w)
-    label = f"{n+d:.2f}"
+    label = f"{time_val:.2f}"
     which_side = None
     
     # Draw current position marker with different shapes
@@ -536,11 +539,11 @@ def draw_debug_visual(frame, n, d, frame_type):
                 font, font_scale*0.9, color, font_thickness)
     if which_side != 0:
         cv2.circle(frame, (x_start, timeline_y), marker_size, (200, 200, 200), thickness)
-        cv2.putText(frame, f"{n}", (x_start-15, timeline_y-20), 
+        cv2.putText(frame, f"{n0}", (x_start-15, timeline_y-20), 
                     font, font_scale*0.9, (200, 200, 200), font_thickness)
     if which_side != 1:
         cv2.circle(frame, (x_end, timeline_y), marker_size, (200, 200, 200), thickness)
-        cv2.putText(frame, f"{n+1}", (x_end-25, timeline_y-20), 
+        cv2.putText(frame, f"{n1}", (x_end-25, timeline_y-20), 
             font, font_scale*0.9, (200, 200, 200), font_thickness)
     return frame
 
@@ -550,21 +553,39 @@ while True:
         temp = None
     else:
         frame = read_buffer.get()
+        
+    is_eof = False
     if frame is None:
-        break
-    if live_scene_detector is not None and live_scene_detector.process_frame(frame, n + 1):
-        scene_changes.add(n + 1)
-    Im1 = I0
-    I0 = I1
-    I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
-    I1 = pad_image(I1)
+        if args.dedup and time <= n:
+            I1 = I0
+            n1 = n
+            is_eof = True
+        else:
+            break
+    else:
+        n += 1
+        if live_scene_detector is not None and live_scene_detector.process_frame(frame, n):
+            scene_changes.add(n)
+            
+        if args.dedup:
+            diff = np.mean(np.abs(frame.astype(np.float32) - last_unique_frame_np.astype(np.float32)))
+            if diff < 2.0 and n not in scene_changes:
+                continue
+                
+        last_unique_frame_np = frame
+
+        Im1 = I0
+        I0 = I1
+        I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+        I1 = pad_image(I1)
+        n1 = n
     
     output = []
     close_enough = 0.0001
-    while time <= n + 1 + close_enough:
-        d = time - n
+    while time <= n1 + close_enough:
+        d = (time - n0) / (n1 - n0) if n1 > n0 else 0
         
-        if (n + 1) in scene_changes:
+        if n1 in scene_changes:
             if Im1 is None:
                 res = I0
                 frame_type = 'copy'
@@ -582,22 +603,26 @@ while True:
                 res = model.inference(I0, I1, d, scale)
                 frame_type = 'interp'
         
-        output.append((res, d, frame_type))
+        output.append((res, d, frame_type, time))
         time += timestep
 
-    for res, d, frame_type in output:
+    for res, d, frame_type, frame_time in output:
         mid = ((res[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0))
         cropped = mid[:h, :w]
         
         # Add debug visualization
         if args.debug:
-            cropped = draw_debug_visual(cropped, n, d, frame_type)
+            cropped = draw_debug_visual(cropped, n0, n1, d, frame_time, frame_type)
         
         write_buffer.put(cropped)
     
-    pbar.update(1)
-    n += 1
-    lastframe = frame
+    pbar.update(n1 - n0)
+    n0 = n1
+    if frame is not None:
+        lastframe = frame
+        
+    if is_eof:
+        break
 
 write_buffer.put(lastframe)
 write_buffer.put(None)
