@@ -36,6 +36,8 @@ parser.add_argument('--debug', dest='debug', action='store_true', help='Enable d
 parser.add_argument('--av1', dest='use_av1', action='store_true', help='Use software AV1 encoding (libaom-av1) instead of h264_nvenc.')
 parser.add_argument('--out_chunks', dest='out_chunks', action='store_true', help='Output streamable chunks via segment muxer')
 parser.add_argument('--dedup', dest='dedup', action='store_true', help='Drop duplicate frames before interpolation to restore smooth motion')
+parser.add_argument('--dedup_global_thresh', dest='dedup_global_thresh', type=float, default=0.5, help='Global MAD threshold for dedup on 64x64 frame')
+parser.add_argument('--dedup_block_thresh', dest='dedup_block_thresh', type=float, default=2.0, help='Max 8x8 block MAD threshold for dedup on 64x64 frame')
 
 args = parser.parse_args()
 
@@ -465,11 +467,16 @@ I1 = torch.from_numpy(np.transpose(lastframe, (2,0,1))).to(device, non_blocking=
 I1 = pad_image(I1)
 temp = None # save lastframe when processing static frame
 time = 0
-n = 0
-n0 = 0
-last_unique_frame_np = lastframe
 
-def draw_debug_visual(frame, n0, n1, d, time_val, frame_type):
+idx_curr = 0
+idx_prev_unique = 0
+idx_last_unique = 0
+idx_prev_prev_unique = 0
+
+last_unique_frame_64 = cv2.resize(cv2.cvtColor(lastframe, cv2.COLOR_BGR2GRAY), (64, 64), interpolation=cv2.INTER_AREA) if args.dedup else None
+dedup_skipped = 0
+
+def draw_debug_visual(frame, idx_prev_unique, idx_last_unique, d, time_val, frame_type):
     """
     Draw debug visualization with shape-based indicators
     frame_type: 'interp', 'source', or 'copy'
@@ -480,8 +487,8 @@ def draw_debug_visual(frame, n0, n1, d, time_val, frame_type):
 
     next_scene_change = None
     if scene_changes:
-        # Find smallest scene change >= current n1
-        future_changes = [sc for sc in scene_changes if sc >= n1]
+        # Find smallest scene change >= current idx_last_unique
+        future_changes = [sc for sc in scene_changes if sc >= idx_last_unique]
         if future_changes:
             next_scene_change = min(future_changes)
     
@@ -523,7 +530,7 @@ def draw_debug_visual(frame, n0, n1, d, time_val, frame_type):
         bottom_right = (x_current + marker_size, timeline_y + marker_size)
         cv2.rectangle(frame, top_left, bottom_right, color, -1)
         which_side = 0 if d < 0.5 else 1
-    else:  # copy
+    else:  # copy or extra
         # Triangle for copied frames
         pts = np.array([
             [x_current, timeline_y - marker_size],  # Top point
@@ -539,11 +546,11 @@ def draw_debug_visual(frame, n0, n1, d, time_val, frame_type):
                 font, font_scale*0.9, color, font_thickness)
     if which_side != 0:
         cv2.circle(frame, (x_start, timeline_y), marker_size, (200, 200, 200), thickness)
-        cv2.putText(frame, f"{n0}", (x_start-15, timeline_y-20), 
+        cv2.putText(frame, f"{idx_prev_unique}", (x_start-15, timeline_y-20), 
                     font, font_scale*0.9, (200, 200, 200), font_thickness)
     if which_side != 1:
         cv2.circle(frame, (x_end, timeline_y), marker_size, (200, 200, 200), thickness)
-        cv2.putText(frame, f"{n1}", (x_end-25, timeline_y-20), 
+        cv2.putText(frame, f"{idx_last_unique}", (x_end-25, timeline_y-20), 
             font, font_scale*0.9, (200, 200, 200), font_thickness)
     return frame
 
@@ -556,41 +563,58 @@ while True:
         
     is_eof = False
     if frame is None:
-        if args.dedup and time <= n:
+        if args.dedup and time <= idx_curr:
             I1 = I0
-            n1 = n
+            idx_last_unique = idx_curr
             is_eof = True
         else:
             break
     else:
-        n += 1
-        if live_scene_detector is not None and live_scene_detector.process_frame(frame, n):
-            scene_changes.add(n)
+        idx_curr += 1
+        if live_scene_detector is not None and live_scene_detector.process_frame(frame, idx_curr):
+            scene_changes.add(idx_curr)
             
         if args.dedup:
-            diff = np.mean(np.abs(frame.astype(np.float32) - last_unique_frame_np.astype(np.float32)))
-            if diff < 2.0 and n not in scene_changes:
-                continue
+            frame_gray_64 = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (64, 64), interpolation=cv2.INTER_AREA)
+            
+            if idx_curr not in scene_changes:
+                diff_full = np.abs(frame_gray_64.astype(np.float32) - last_unique_frame_64.astype(np.float32))
+                global_mad = np.mean(diff_full)
                 
-        last_unique_frame_np = frame
+                blocks = diff_full.reshape(8, 8, 8, 8)
+                max_block_mad = np.max(np.mean(blocks, axis=(1, 3)))
+                
+                if global_mad < args.dedup_global_thresh and max_block_mad < args.dedup_block_thresh:
+                    dedup_skipped += 1
+                    continue
+                    
+            last_unique_frame_64 = frame_gray_64
+
+        idx_prev_prev_unique = idx_prev_unique
+        idx_prev_unique = idx_last_unique
+        idx_last_unique = idx_curr
 
         Im1 = I0
         I0 = I1
         I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
         I1 = pad_image(I1)
-        n1 = n
     
     output = []
     close_enough = 0.0001
-    while time <= n1 + close_enough:
-        d = (time - n0) / (n1 - n0) if n1 > n0 else 0
+    while time <= idx_last_unique + close_enough:
+        d = (time - idx_prev_unique) / (idx_last_unique - idx_prev_unique) if idx_last_unique > idx_prev_unique else 0
         
-        if n1 in scene_changes:
+        if idx_last_unique in scene_changes:
             if Im1 is None:
                 res = I0
                 frame_type = 'copy'
             else:
-                res = model.inference(Im1, I0, 1.0 + d, scale)
+                gap_prev = idx_prev_unique - idx_prev_prev_unique
+                if gap_prev == 0:
+                    gap_prev = 1
+                extrap_factor = (time - idx_prev_unique) / gap_prev
+                
+                res = model.inference(Im1, I0, 1.0 + extrap_factor, scale)
                 frame_type = 'extra'
         else:
             if d < close_enough:
@@ -599,6 +623,9 @@ while True:
             elif d > 1 - close_enough:
                 res = I1
                 frame_type = 'source'
+            elif is_eof:
+                res = I0
+                frame_type = 'copy'
             else:
                 res = model.inference(I0, I1, d, scale)
                 frame_type = 'interp'
@@ -610,14 +637,13 @@ while True:
         mid = ((res[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0))
         cropped = mid[:h, :w]
         
-        # Add debug visualization
         if args.debug:
-            cropped = draw_debug_visual(cropped, n0, n1, d, frame_time, frame_type)
+            cropped = draw_debug_visual(cropped, idx_prev_unique, idx_last_unique, d, frame_time, frame_type)
         
         write_buffer.put(cropped)
     
-    pbar.update(n1 - n0)
-    n0 = n1
+    pbar.update(idx_last_unique - idx_prev_unique)
+    
     if frame is not None:
         lastframe = frame
         
@@ -631,6 +657,8 @@ import time
 while(not write_buffer.empty()):
     time.sleep(0.1)
 pbar.close()
+if args.dedup:
+    print(f"Dedup: skipped {dedup_skipped} duplicate frames.")
 if live_scene_detector is not None:
     print(f"Detected {len(scene_changes)} scene changes via live hash.\n{scene_changes}")
 if not vid_out is None:
