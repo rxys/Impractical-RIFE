@@ -611,7 +611,18 @@ while True:
         
     is_eof = False
     if frame is None:
-        if args.dedup and time <= idx_curr:
+        decoded_all_frames = idx_curr + 1 == int(round(tot_frames))
+        if (
+            range_end_output is not None
+            and range_end == int(round(tot_frames))
+            and decoded_all_frames
+            and output_index < range_end_output
+        ):
+            I0 = I1
+            idx_prev_unique = idx_last_unique
+            idx_last_unique = range_end
+            is_eof = True
+        elif args.dedup and time <= idx_curr:
             I1 = I0
             idx_last_unique = idx_curr
             is_eof = True
