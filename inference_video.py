@@ -13,6 +13,7 @@ from queue import Queue, Empty
 from vidgear.gears import WriteGear
 from vidgear.gears import VideoGear
 import math
+from fractions import Fraction
 
 warnings.filterwarnings("ignore")
 
@@ -35,11 +36,24 @@ parser.add_argument('--fixed_height', type=int, default=None, help='Fixed vertic
 parser.add_argument('--debug', dest='debug', action='store_true', help='Enable debug visualization')
 parser.add_argument('--av1', dest='use_av1', action='store_true', help='Use software AV1 encoding (libaom-av1) instead of h264_nvenc.')
 parser.add_argument('--out_chunks', dest='out_chunks', action='store_true', help='Output streamable chunks via segment muxer')
+parser.add_argument('--range', dest='frame_range', type=int, nargs=2, metavar=('START', 'END'), help='Process source-frame interval [START, END); boundaries must align to output frames')
+parser.add_argument('--gop', type=int, default=None, help='GOP size for ranged chunk output')
 parser.add_argument('--dedup', dest='dedup', action='store_true', help='Drop duplicate frames before interpolation to restore smooth motion')
 parser.add_argument('--dedup_global_thresh', dest='dedup_global_thresh', type=float, default=0.5, help='Global MAD threshold for dedup on 64x64 frame')
 parser.add_argument('--dedup_block_thresh', dest='dedup_block_thresh', type=float, default=2.0, help='Max 8x8 block MAD threshold for dedup on 64x64 frame')
 
 args = parser.parse_args()
+
+if args.frame_range is not None:
+    range_start, range_end = args.frame_range
+    if range_start < 0 or range_end <= range_start:
+        parser.error("--range requires 0 <= START < END")
+    if args.out_chunks and args.gop is None:
+        parser.error("--gop is required with --range --out_chunks")
+elif args.gop is not None:
+    parser.error("--gop is only valid with --range")
+if args.gop is not None and args.gop <= 0:
+    parser.error("--gop must be greater than zero")
 
 from model.warplayer import warp
 
@@ -225,6 +239,29 @@ source_fps = videoCapture.get(cv2.CAP_PROP_FPS) / args.drop_input
 timestep = source_fps / args.fps
 tot_frames = videoCapture.get(cv2.CAP_PROP_FRAME_COUNT)
 videoCapture.release()
+
+range_start_output = range_end_output = expected_range_frames = None
+chunk_frames = segment_frames = None
+if args.frame_range is not None:
+    ratio = Fraction(args.fps / source_fps).limit_denominator(1000)
+    if not math.isclose(float(ratio), args.fps / source_fps, rel_tol=1e-7, abs_tol=1e-7):
+        parser.error("could not resolve an exact source/output frame ratio")
+    range_start, range_end = args.frame_range
+    if range_start % ratio.denominator or range_end % ratio.denominator:
+        parser.error(
+            f"--range boundaries must be multiples of {ratio.denominator} source frames "
+            f"for the {ratio.numerator}/{ratio.denominator} output ratio"
+        )
+    range_start_output = range_start * ratio.numerator // ratio.denominator
+    range_end_output = range_end * ratio.numerator // ratio.denominator
+    expected_range_frames = range_end_output - range_start_output
+
+    if args.out_chunks:
+        chunk_unit = math.lcm(args.gop, ratio.numerator)
+        chunk_frames = max(chunk_unit, int(args.fps * 10 / chunk_unit + 0.5) * chunk_unit)
+        cuts = range(chunk_frames, expected_range_frames, chunk_frames)
+        segment_frames = ",".join(map(str, cuts)) or str(chunk_frames)
+
 videogen = VideoGear(source=args.video, backend='ffmpeg').start()
 first_frame = videogen.read()
 lastframe = first_frame.copy() if first_frame is not None else None
@@ -399,10 +436,19 @@ else:
             "-tune": "hq",
         }
 
+    if args.frame_range is not None and args.out_chunks:
+        output_params["-g"] = args.gop
+        output_params["-force_key_frames"] = f"expr:gte(n,n_forced*{chunk_frames})"
+        if not args.use_av1:
+            output_params["-forced-idr"] = "1"
+
     if args.out_chunks:
         output_params["-f"] = "segment"
-        output_params["-segment_time"] = "10"
         output_params["-reset_timestamps"] = "1"
+        if args.frame_range is not None:
+            output_params["-segment_frames"] = segment_frames
+        else:
+            output_params["-segment_time"] = "10"
 
     if args.output is not None:
         vid_out_name = args.output
@@ -467,6 +513,8 @@ I1 = torch.from_numpy(np.transpose(lastframe, (2,0,1))).to(device, non_blocking=
 I1 = pad_image(I1)
 temp = None # save lastframe when processing static frame
 time = 0
+output_index = 0
+emitted_frames = 0
 
 idx_curr = 0
 idx_prev_unique = 0
@@ -601,7 +649,11 @@ while True:
     
     output = []
     close_enough = 0.0001
-    while time <= idx_last_unique + close_enough:
+    while range_start_output is not None and output_index < range_start_output and time <= idx_last_unique + close_enough:
+        output_index += 1
+        time = output_index * timestep
+
+    while time <= idx_last_unique + close_enough and (range_end_output is None or output_index < range_end_output):
         d = (time - idx_prev_unique) / (idx_last_unique - idx_prev_unique) if idx_last_unique > idx_prev_unique else 0
         
         if idx_last_unique in scene_changes:
@@ -631,8 +683,10 @@ while True:
                 frame_type = 'interp'
         
         output.append((res, d, frame_type, time))
-        time += timestep
+        output_index += 1
+        time = output_index * timestep if range_start_output is not None else time + timestep
 
+    emitted_frames += len(output)
     for res, d, frame_type, frame_time in output:
         mid = ((res[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0))
         cropped = mid[:h, :w]
@@ -647,10 +701,17 @@ while True:
     if frame is not None:
         lastframe = frame
         
-    if is_eof:
+    if (range_end_output is not None and output_index >= range_end_output) or is_eof:
         break
 
-write_buffer.put(lastframe)
+range_error = None
+if args.frame_range is None:
+    write_buffer.put(lastframe)
+elif emitted_frames != expected_range_frames:
+    range_error = RuntimeError(
+        f"range produced {emitted_frames} frames; expected {expected_range_frames}. "
+        "The END boundary is past the decodable source timeline."
+    )
 write_buffer.put(None)
 
 import time
@@ -663,3 +724,5 @@ if live_scene_detector is not None:
     print(f"Detected {len(scene_changes)} scene changes via live hash.\n{scene_changes}")
 if not vid_out is None:
     vid_out.close()
+if range_error is not None:
+    raise range_error
