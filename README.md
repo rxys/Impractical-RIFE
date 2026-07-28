@@ -2,36 +2,33 @@
 
 > Silky-smooth slow-mo from any video, no blender needed.
 
----
-
 ## Installation
+
+Smoothie needs Linux, an NVIDIA graphics card, and FFmpeg.
 
 ```bash
 git clone https://github.com/rxys/Impractical-RIFE.git
-cd smoothie
+cd Impractical-RIFE
 pip install -r requirements.txt
+vapoursynth config
 ```
 
-Download or train your RIFE HD model and place weights in `train_log/`.
-
----
+The first video may take longer while Smoothie prepares the model. Later runs
+can reuse it.
 
 ## Usage
 
 ```bash
-python interpolate_video.py \
-  --video input.mp4       # Path to source video
-  --fps 60                # Target FPS (e.g., 24, 30, 60, 240)
-  --output out.mp4        # (Optional) Output file path
-  --model train_log       # Model directory
-  --fp16                  # (Optional) Enable FP16
-  --png                   # (Optional) Export PNG frames
-  --fixed_height 1440      # (Optional) Downscale height
+python inference_video.py --video input.mp4 --fps 60 --output smooth.mp4
 ```
 
-Run `python interpolate_video.py --help` for full options.
+This turns `input.mp4` into a 60 FPS video named `smooth.mp4`.
 
----
+For more choices:
+
+```bash
+python inference_video.py --help
+```
 
 ## License
 

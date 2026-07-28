@@ -1,4 +1,14 @@
-numpy>=1.16
-tqdm>=4.35.0
-opencv-python>=4.1.2
-vidgear>=0.3.3
+--extra-index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://pypi.nvidia.com
+
+torch==2.11.0
+torchcodec @ https://download.pytorch.org/whl/cu126/torchcodec-0.13.0%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl
+torch-tensorrt==2.11.0
+tensorrt-cu12==10.14.1.48.post1
+vapoursynth==77
+vsrife==5.7.0
+numpy>=2.0,<3
+opencv-python>=4.10
+tqdm>=4.67
+vidgear>=0.3.5
+dllist

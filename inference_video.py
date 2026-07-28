@@ -1,5 +1,7 @@
 import re
 import os
+import ctypes
+import importlib.util
 import cv2
 import torch
 import argparse
@@ -9,11 +11,12 @@ from torch.nn import functional as F
 import warnings
 import _thread
 import subprocess
-from queue import Queue, Empty
-from vidgear.gears import WriteGear
+from queue import Queue
 from vidgear.gears import VideoGear
 import math
+import time as walltime
 from fractions import Fraction
+from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
@@ -26,21 +29,20 @@ parser.add_argument('--scene_hash_size', dest='scene_hash_size', type=int, defau
 parser.add_argument('--scene_hash_lowpass', dest='scene_hash_lowpass', type=int, default=2, help='DCT lowpass factor for hash scene detection')
 parser.add_argument('--scene_min_len', dest='scene_min_len', type=float, default=0.5, help='Minimum seconds between scene cuts')
 parser.add_argument('--output', dest='output', type=str, default=None)
-parser.add_argument('--model', dest='modelDir', type=str, default='train_log', help='directory with trained model files')
-parser.add_argument('--fp16', dest='fp16', action='store_true', help='fp16 mode for faster and more lightweight inference on cards with Tensor Cores')
 parser.add_argument('--fps', dest='fps', type=float, default=None, required=True)
-parser.add_argument('--png', dest='png', action='store_true', help='whether to vid_out png format vid_outs')
 parser.add_argument('--ext', dest='ext', type=str, default='mp4', help='vid_out video extension')
 parser.add_argument('--drop_input', dest='drop_input', type=int, default=1, help='Only keep every Nth input frame (1 = keep all, 2 = drop every other, etc.)')
 parser.add_argument('--fixed_height', type=int, default=None, help='Fixed vertical resolution for downscaling while keeping aspect ratio')
 parser.add_argument('--debug', dest='debug', action='store_true', help='Enable debug visualization')
-parser.add_argument('--av1', dest='use_av1', action='store_true', help='Use software AV1 encoding (libaom-av1) instead of h264_nvenc.')
+parser.add_argument('--av1', dest='use_av1', action='store_true', help='Use GPU AV1 encoding (av1_nvenc) instead of h264_nvenc')
 parser.add_argument('--out_chunks', dest='out_chunks', action='store_true', help='Output streamable chunks via segment muxer')
 parser.add_argument('--range', dest='frame_range', type=int, nargs=2, metavar=('START', 'END'), help='Process source-frame interval [START, END); boundaries must align to output frames')
 parser.add_argument('--gop', type=int, default=None, help='GOP size for ranged chunk output')
 parser.add_argument('--dedup', dest='dedup', action='store_true', help='Drop duplicate frames before interpolation to restore smooth motion')
 parser.add_argument('--dedup_global_thresh', dest='dedup_global_thresh', type=float, default=0.5, help='Global MAD threshold for dedup on 64x64 frame')
 parser.add_argument('--dedup_block_thresh', dest='dedup_block_thresh', type=float, default=2.0, help='Max 8x8 block MAD threshold for dedup on 64x64 frame')
+parser.add_argument('--batch_timestamps', dest='batch_timestamps', type=int, default=1, help='Batch this many interpolation timestamps for the same source-frame pair; benchmark before increasing')
+parser.add_argument('--pad_multiple', dest='pad_multiple', type=int, default=64, choices=[64, 128], help='Spatial padding alignment')
 
 args = parser.parse_args()
 
@@ -54,6 +56,10 @@ elif args.gop is not None:
     parser.error("--gop is only valid with --range")
 if args.gop is not None and args.gop <= 0:
     parser.error("--gop must be greater than zero")
+if args.batch_timestamps <= 0:
+    parser.error("--batch_timestamps must be greater than zero")
+if args.batch_timestamps != 1:
+    parser.error("VS-RIFE TensorRT currently requires --batch_timestamps=1")
 
 from model.warplayer import warp
 
@@ -123,12 +129,31 @@ def forward_warp(img, flow):
     result = result.to(img.dtype)
 
     # Approximate inverse warp for newly exposed holes.
-    fallback = warp(img, -flow.to(img.dtype))
+    backward_x = 2.0 * (xx.unsqueeze(0) - flow[:, 0].float()) / max(W - 1, 1) - 1.0
+    backward_y = 2.0 * (yy.unsqueeze(0) - flow[:, 1].float()) / max(H - 1, 1) - 1.0
+    backward_grid = torch.stack((backward_x, backward_y), dim=-1)
+    fallback = F.grid_sample(
+        img.float(),
+        backward_grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    ).to(img.dtype)
 
     return torch.where(weight_sum > 1e-6, result, fallback)
 
 
-def forward_monkey(self, x, timestep=0.5, scale_list=[16, 8, 4, 2, 1], training=False, fastmode=True, ensemble=False):
+def forward_monkey(
+    self,
+    x,
+    timestep=0.5,
+    scale_list=[16, 8, 4, 2, 1],
+    training=False,
+    fastmode=True,
+    ensemble=False,
+    cached_f0=None,
+    cached_f1=None,
+):
     if training == False:
         channel = x.shape[1] // 2
         img0 = x[:, :channel]
@@ -168,10 +193,10 @@ def forward_monkey(self, x, timestep=0.5, scale_list=[16, 8, 4, 2, 1], training=
 
     if not torch.is_tensor(timestep):
         timestep = (x[:, :1].clone() * 0 + 1) * timestep
-    else:
-        timestep = timestep.repeat(1, 1, img0.shape[2], img0.shape[3])
-    f0 = self.encode(img0[:, :3])
-    f1 = self.encode(img1[:, :3])
+    elif timestep.shape[2:] != img0.shape[2:]:
+        timestep = timestep.expand(-1, -1, img0.shape[2], img0.shape[3])
+    f0 = self.encode(img0[:, :3]) if cached_f0 is None else cached_f0
+    f1 = self.encode(img1[:, :3]) if cached_f1 is None else cached_f1
     flow_list = []
     merged = []
     mask_list = []
@@ -214,25 +239,297 @@ def forward_monkey(self, x, timestep=0.5, scale_list=[16, 8, 4, 2, 1], training=
     return flow_list, mask_list[4], merged
 
 
-from train_log.IFNet_HDv3 import IFNet
-IFNet.forward = forward_monkey
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if not torch.cuda.is_available():
+    parser.error("CUDA is required")
+device = torch.device("cuda")
 torch.set_grad_enabled(False)
-if torch.cuda.is_available():
-    torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True
-    if(args.fp16):
-        torch.set_default_tensor_type(torch.cuda.HalfTensor)
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
 
-from train_log.RIFE_HDv3 import Model
-model = Model()
-if not hasattr(model, 'version'):
-    model.version = 0
-model.load_model(args.modelDir, -1)
-print("Loaded 3.x/4.x HD model.")
-model.eval()
-model.device()
+flow_engine = None
+encode_engine = None
+ten_flow_div = None
+warp_grid = None
+timestamp_tensors = {}
+cached_f0 = None
+cached_f1 = None
+cached_pair_key = None
+previous_pair_img1 = None
+previous_pair_f1 = None
+
+def trt_warp(img, flow, flow_div, warp_grid):
+    dtype = img.dtype
+    flow = flow.float() / flow_div.view(1, 2, 1, 1)
+    grid = (warp_grid + flow).permute(0, 2, 3, 1)
+    return F.grid_sample(
+        img.float(), grid, mode="bilinear", padding_mode="border", align_corners=True
+    ).to(dtype)
+
+def trt_forward_with_flow(self, img0, img1, timestep, flow_div, warp_grid, f0, f1):
+    img0 = img0.clamp(0.0, 1.0)
+    img1 = img1.clamp(0.0, 1.0)
+    warped0, warped1 = img0, img1
+    flow = mask = None
+    for i, block in enumerate((self.block0, self.block1, self.block2, self.block3, self.block4)):
+        if flow is None:
+            flow, mask, feat = block(
+                torch.cat((img0, img1, f0, f1, timestep), 1),
+                None,
+                scale=self.scale_list[i],
+            )
+        else:
+            wf0 = trt_warp(f0, flow[:, :2], flow_div, warp_grid)
+            wf1 = trt_warp(f1, flow[:, 2:4], flow_div, warp_grid)
+            delta, mask, feat = block(
+                torch.cat((warped0, warped1, wf0, wf1, timestep, mask, feat), 1),
+                flow,
+                scale=self.scale_list[i],
+            )
+            flow = flow + delta
+        warped0 = trt_warp(img0, flow[:, :2], flow_div, warp_grid)
+        warped1 = trt_warp(img1, flow[:, 2:4], flow_div, warp_grid)
+    mask = torch.sigmoid(mask)
+    return warped0 * mask + warped1 * (1 - mask), flow
+
+def ensure_vsrife_engines(img0, img1):
+    global flow_engine, encode_engine, ten_flow_div, warp_grid
+    if flow_engine is not None:
+        return
+
+    setup_started = walltime.perf_counter()
+    print(f"[trt] loading engines for {img0.shape[-1]}x{img0.shape[-2]}", flush=True)
+    import gc
+
+    model_version = "4.26"
+    padded_height, padded_width = img0.shape[-2:]
+    workspace_bytes = 4 * (1 << 30)
+    engine_dir = Path("/content/vs_rife_benchmark/engines-flow-v2")
+    engine_dir.mkdir(parents=True, exist_ok=True)
+
+    def find_flow_engines():
+        return sorted(
+            path
+            for path in engine_dir.glob(
+                f"flownet_v{model_version}.pkl_"
+                f"{padded_width}x{padded_height}_fp16_*_"
+                f"workspace-{workspace_bytes}_level-5.ts"
+            )
+            if not path.name.endswith(".encode")
+        )
+
+    engine_paths = find_flow_engines()
+    if not engine_paths:
+        print(
+            f"[trt] cached cores do not include {padded_width}x{padded_height}; "
+            "installing the builder",
+            flush=True,
+        )
+        try:
+            import superfast
+            superfast._install_builder()
+        except ImportError:
+            pass
+        import torch_tensorrt
+        # These packages are compiler/build-time dependencies only. Keeping them
+        # out of the cached-engine path makes a small runtime artifact possible.
+        import vapoursynth as vs
+        import vsrife
+        from vsrife import rife
+        from vsrife.__main__ import download_model
+        from vsrife.IFNet_HDv3_v4_26 import IFNet
+
+        IFNet.forward = trt_forward_with_flow
+
+        model_dir = Path(vsrife.__file__).resolve().parent / "models"
+        model_path = model_dir / f"flownet_v{model_version}.pkl"
+        if not model_path.exists() or model_path.stat().st_size == 0:
+            download_model(
+                "https://github.com/HolyWu/vs-rife/releases/download/model/"
+                f"flownet_v{model_version}.pkl"
+            )
+        print(
+            f"Building VS-RIFE TensorRT engines for "
+            f"{padded_width}x{padded_height}; this is a one-time setup cost."
+        )
+        core = vs.core
+        blank = core.std.BlankClip(
+            width=padded_width,
+            height=padded_height,
+            length=2,
+            format=vs.RGBH,
+            fpsnum=24,
+            fpsden=1,
+            keep=True,
+        )
+        built = rife(
+            blank,
+            device_index=0,
+            model=model_version,
+            auto_download=False,
+            fps_num=60,
+            fps_den=1,
+            scale=1.0,
+            ensemble=False,
+            sc=False,
+            trt=True,
+            trt_static_shape=True,
+            trt_workspace_size=workspace_bytes,
+            trt_max_aux_streams=None,
+            trt_optimization_level=5,
+            trt_cache_dir=str(engine_dir),
+        )
+        del built, blank
+        if hasattr(core, "clear_cache"):
+            core.clear_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+        engine_paths = find_flow_engines()
+    else:
+        # Loading serialized Torch-TensorRT engines only needs the runtime
+        # registration library. Avoid importing the compiler-facing Python
+        # package and its ONNX parser dependency on cached-engine startups.
+        runtime_entries = {
+            Path(entry)
+            for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+            if entry and Path(entry).is_dir()
+        }
+        runtime_spec = importlib.util.find_spec("torch_tensorrt")
+        if runtime_spec and runtime_spec.submodule_search_locations:
+            runtime_entries.update(Path(entry).parent for entry in runtime_spec.submodule_search_locations)
+        runtime_libraries = [
+            path
+            for entry in runtime_entries
+            for path in (
+                entry / "torch_tensorrt" / "lib" / "libtorchtrt_runtime.so",
+                entry / "torch_tensorrt" / "lib" / "libtorchtrt_plugins.so",
+            )
+            if path.is_file()
+        ]
+        if not runtime_libraries:
+            raise RuntimeError("Torch-TensorRT runtime libraries were not found")
+        native_libraries = []
+        for entry in runtime_entries:
+            for folder in (
+                entry / "tensorrt_libs",
+                entry / "tensorrt_cu12_libs",
+                entry / "nvidia" / "tensorrt" / "lib",
+            ):
+                if folder.is_dir():
+                    native_libraries.extend(folder.glob("libnvinfer.so*"))
+                    native_libraries.extend(folder.glob("libnvinfer_plugin.so*"))
+        for library in sorted(set(native_libraries), key=lambda path: "plugin" in path.name):
+            ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
+        for library in runtime_libraries:
+            torch.ops.load_library(str(library))
+
+    assert len(engine_paths) == 1, (
+        f"Expected one matching VS-RIFE flow engine, found: {engine_paths}"
+    )
+    flow_path = engine_paths[0]
+    encode_path = Path(str(flow_path) + ".encode")
+    assert encode_path.is_file(), f"Missing VS-RIFE encode engine: {encode_path}"
+
+    flow_engine = torch.jit.load(str(flow_path)).eval()
+    encode_engine = torch.jit.load(str(encode_path)).eval()
+    ten_flow_div = torch.tensor(
+        [(padded_width - 1.0) / 2.0, (padded_height - 1.0) / 2.0],
+        device=device,
+        dtype=torch.float32,
+    )
+    horizontal = torch.linspace(
+        -1.0, 1.0, padded_width, device=device, dtype=torch.float32
+    ).view(1, 1, 1, padded_width).expand(-1, -1, padded_height, -1)
+    vertical = torch.linspace(
+        -1.0, 1.0, padded_height, device=device, dtype=torch.float32
+    ).view(1, 1, padded_height, 1).expand(-1, -1, -1, padded_width)
+    warp_grid = torch.cat([horizontal, vertical], 1)
+
+    warm_f0 = encode_engine(img0)
+    warm_f1 = encode_engine(img1)
+    warm_timestep = torch.full(
+        (1, 1, padded_height, padded_width),
+        0.5,
+        device=device,
+        dtype=img0.dtype,
+    )
+    for _ in range(4):
+        flow_engine(
+            img0,
+            img1,
+            warm_timestep,
+            ten_flow_div,
+            warp_grid,
+            warm_f0,
+            warm_f1,
+        )
+    torch.cuda.synchronize()
+    print(
+        f"VS-RIFE TensorRT load/build+warmup: "
+        f"{walltime.perf_counter() - setup_started:.2f}s"
+    )
+
+def get_pair_features(img0, img1):
+    global cached_f0, cached_f1, cached_pair_key
+    global previous_pair_img1, previous_pair_f1
+    ensure_vsrife_engines(img0, img1)
+    key = (
+        img0.data_ptr(),
+        img1.data_ptr(),
+        tuple(img0.shape),
+        tuple(img1.shape),
+    )
+    if key != cached_pair_key:
+        cached_f0 = (
+            previous_pair_f1
+            if img0 is previous_pair_img1
+            else encode_engine(img0)
+        )
+        cached_f1 = encode_engine(img1)
+        previous_pair_img1 = img1
+        previous_pair_f1 = cached_f1
+        cached_pair_key = key
+    return cached_f0, cached_f1
+
+def run_inference(img0, img1, timestep, inference_scale=1):
+    if inference_scale != 1:
+        raise ValueError("VS-RIFE TensorRT supports inference_scale=1 only")
+    if torch.is_tensor(timestep):
+        if timestep.numel() != 1:
+            raise ValueError("VS-RIFE TensorRT uses one timestamp per execution")
+        timestamp = float(timestep.item())
+    else:
+        timestamp = float(timestep)
+
+    f0, f1 = get_pair_features(img0, img1)
+    timestamp_key = round(timestamp, 8)
+    timestep_tensor = timestamp_tensors.get(timestamp_key)
+    if timestep_tensor is None:
+        timestep_tensor = torch.full(
+            (1, 1, img0.shape[-2], img0.shape[-1]),
+            timestamp,
+            device=img0.device,
+            dtype=img0.dtype,
+        )
+        timestamp_tensors[timestamp_key] = timestep_tensor
+    if timestamp > 1.0:
+        midpoint = timestamp_tensors.get(0.5)
+        if midpoint is None:
+            midpoint = torch.full_like(timestep_tensor, 0.5)
+            timestamp_tensors[0.5] = midpoint
+        _, flow = flow_engine(
+            img0, img1, midpoint, ten_flow_div, warp_grid, f0, f1
+        )
+        velocity_mid = flow[:, 2:4] - flow[:, :2]
+        velocity_at_img1 = forward_warp(velocity_mid, flow[:, 2:4])
+        result = forward_warp(img1, (timestamp - 1.0) * velocity_at_img1)
+    else:
+        result, _ = flow_engine(
+            img0, img1, timestep_tensor, ten_flow_div, warp_grid, f0, f1
+        )
+    ready = os.environ.pop("SMOOTHIE_CACHE_READY", None)
+    if ready:
+        Path(ready).touch()
+    return result
 
 videoCapture = cv2.VideoCapture(args.video)
 source_fps = videoCapture.get(cv2.CAP_PROP_FPS) / args.drop_input
@@ -242,6 +539,7 @@ videoCapture.release()
 
 range_start_output = range_end_output = expected_range_frames = None
 chunk_frames = segment_frames = None
+decode_start = 0
 if args.frame_range is not None:
     ratio = Fraction(args.fps / source_fps).limit_denominator(1000)
     if not math.isclose(float(ratio), args.fps / source_fps, rel_tol=1e-7, abs_tol=1e-7):
@@ -255,6 +553,7 @@ if args.frame_range is not None:
     range_start_output = range_start * ratio.numerator // ratio.denominator
     range_end_output = range_end * ratio.numerator // ratio.denominator
     expected_range_frames = range_end_output - range_start_output
+    decode_start = max(0, range_start - 1)
 
     if args.out_chunks:
         chunk_unit = math.lcm(args.gop, ratio.numerator)
@@ -262,8 +561,20 @@ if args.frame_range is not None:
         cuts = range(chunk_frames, expected_range_frames, chunk_frames)
         segment_frames = ",".join(map(str, cuts)) or str(chunk_frames)
 
-videogen = VideoGear(source=args.video, backend='ffmpeg').start()
+print(
+    f"[decode] opening {args.video} at source frame {decode_start} "
+    f"for range {args.frame_range}",
+    flush=True,
+)
+videogen = VideoGear(
+    source=args.video,
+    backend='ffmpeg',
+    **({"CAP_PROP_POS_FRAMES": decode_start} if decode_start else {}),
+).start()
 first_frame = videogen.read()
+print(f"[decode] first frame received: {first_frame is not None}", flush=True)
+if first_frame is None:
+    raise RuntimeError(f"Decoder returned no frame at source frame {decode_start}")
 lastframe = first_frame.copy() if first_frame is not None else None
 video_path_wo_ext, ext = os.path.splitext(args.video)
 h, w, _ = lastframe.shape
@@ -320,6 +631,90 @@ class HashSceneDetector:
             return True
         return False
 
+class TorchHashSceneDetector:
+    def __init__(self, threshold, size, lowpass, min_scene_len_frames):
+        self.threshold = threshold
+        self.size = size
+        self.size_sq = float(size * size)
+        self.lowpass = lowpass
+        self.min_scene_len_frames = min_scene_len_frames
+        self.last_hash = None
+        self.last_hash_cpu = None
+        self.last_scene_cut = 0
+        self.last_score = None
+        self._shape = None
+        self._wy = None
+        self._wx = None
+        self._dct = None
+
+    @staticmethod
+    def _area_weights(input_size, output_size, device):
+        scale = input_size / output_size
+        source = torch.arange(input_size, device=device, dtype=torch.float32)
+        starts = torch.arange(output_size, device=device, dtype=torch.float32) * scale
+        ends = starts + scale
+        overlap = torch.minimum(ends[:, None], source[None, :] + 1.0)
+        overlap -= torch.maximum(starts[:, None], source[None, :])
+        return overlap.clamp_(0.0, 1.0) / scale
+
+    def _prepare(self, height, width, device):
+        shape = (height, width, device)
+        if self._shape == shape:
+            return
+        output_size = self.size * self.lowpass
+        self._wy = self._area_weights(height, output_size, device)
+        self._wx = self._area_weights(width, output_size, device)
+        n = torch.arange(output_size, device=device, dtype=torch.float32)
+        k = torch.arange(self.size, device=device, dtype=torch.float32)[:, None]
+        dct = torch.cos(math.pi / output_size * (n[None, :] + 0.5) * k)
+        dct[0] *= math.sqrt(1.0 / output_size)
+        if self.size > 1:
+            dct[1:] *= math.sqrt(2.0 / output_size)
+        self._dct = dct
+        self._shape = shape
+
+    def hash_frame(self, frame_tensor):
+        # Reproduce OpenCV's integer BGR->GRAY result from our RGB CUDA tensor.
+        frame = frame_tensor[0, :, :h, :w].float().mul(255.0).round_()
+        gray = torch.floor(
+            (
+                frame[0] * 4899.0
+                + frame[1] * 9617.0
+                + frame[2] * 1868.0
+                + 8192.0
+            )
+            / 16384.0
+        )
+        self._prepare(gray.shape[0], gray.shape[1], gray.device)
+        resized = self._wy @ gray @ self._wx.t()
+        resized = resized.round_()
+        max_value = resized.max().clamp_min(1.0)
+        resized = resized / max_value
+        low = self._dct @ resized @ self._dct.t()
+        flat = low.flatten().sort().values
+        middle = flat.numel() // 2
+        median = (flat[middle - 1] + flat[middle]) * 0.5
+        return low > median
+
+    def process_frame(self, frame_tensor, frame_index):
+        curr_hash = self.hash_frame(frame_tensor)
+        self.last_hash_cpu = curr_hash.byte().cpu().numpy().astype(bool)
+        if self.last_hash is None:
+            self.last_hash = curr_hash
+            self.last_score = None
+            return False
+        hash_dist = torch.count_nonzero(curr_hash != self.last_hash).item()
+        hash_dist_norm = hash_dist / self.size_sq
+        self.last_hash = curr_hash
+        self.last_score = hash_dist_norm
+        if (
+            hash_dist_norm >= self.threshold
+            and frame_index - self.last_scene_cut >= self.min_scene_len_frames
+        ):
+            self.last_scene_cut = frame_index
+            return True
+        return False
+
 def detect_scenes_ffmpeg():
     pattern = re.compile(
         r"showinfo.*?\bn:\s*(\d+).*?\bpts:\s*(\d+).*?\bpts_time:\s*([0-9.]+)",
@@ -367,20 +762,20 @@ def detect_scenes_ffmpeg():
     return scene_changes
 
 scene_changes = set()
-live_scene_detector = None
+gpu_scene_detector = None
 
 if args.scene_detector == 'ffmpeg':
     scene_changes = detect_scenes_ffmpeg()
     print(f"Detected {len(scene_changes)} scene changes via ffmpeg.\n{scene_changes}")
 elif args.scene_detector == 'hash':
     min_scene_len_frames = max(1, int(round(args.scene_min_len * source_fps)))
-    live_scene_detector = HashSceneDetector(
+    detector_options = dict(
         threshold=args.scene_hash_threshold,
         size=args.scene_hash_size,
         lowpass=args.scene_hash_lowpass,
         min_scene_len_frames=min_scene_len_frames,
     )
-    live_scene_detector.process_frame(lastframe, 0)
+    gpu_scene_detector = TorchHashSceneDetector(**detector_options)
     hash_res = args.scene_hash_size * args.scene_hash_lowpass
     print(
         "Using live hash scene detection on decoded frames "
@@ -391,88 +786,64 @@ else:
     print("Scene detection disabled.")
 
 vid_out_name = None
-vid_out = None
-if args.png:
-    if not os.path.exists('vid_out'):
-        os.mkdir('vid_out')
+if args.output is not None:
+    vid_out_name = args.output
 else:
-    if args.use_av1:
-        print("Using software AV1 (libaom-av1) encoder for high quality output.")
-        # High quality, single-pass CRF settings for libaom-av1
-        output_params = {
-            "-input_framerate": args.fps,
-            "-vcodec": "libaom-av1",
-            "-crf": "24", # Target Constant Quality mode
-            "-cpu-used": "4", # Balance of speed and quality (Lower is slower/better)
-            "-row-mt": "1", # Enable row-based multithreading
-            "-pix_fmt": "yuv420p",
-            "-b:v": "0", # Ensures CRF mode
-            "-tune": "ssim", # Tune for structural similarity/visual quality
-        }
-    else:
-        print("Using hardware H.264 (h264_nvenc).")
-        max_bpp = 0.227 
-        maxrate = int(max_bpp * w * h * args.fps)
-        
-        output_params = {
-            "-input_framerate": args.fps,
-            "-vcodec": "h264_nvenc",
-            "-rc": "vbr",
-            "-cq": "24",
-            "-maxrate": f"{maxrate // 1_000_000}M",
-            "-bufsize": f"{(maxrate * 2) // 1_000_000}M",
-            "-preset": "p5",
-            "-rc-lookahead": "48",
-            "-spatial_aq": "1",
-            "-temporal_aq": "1",
-            "-aq-strength": "10",
-            "-bf": "3",
-            "-refs": "4",
-            "-g": args.fps * 2,
-            "-profile:v": "high",
-            "-pix_fmt": "yuv420p",
-            "-b:v": "0",
-            # Only if Turing/Ampere GPU:
-            "-tune": "hq",
-        }
+    multi = int(args.fps / source_fps) if source_fps else 1
+    vid_out_name = '{}_{}X_{}fps.{}'.format(
+        video_path_wo_ext, multi, int(np.round(args.fps)), args.ext
+    )
 
-    if args.frame_range is not None and args.out_chunks:
-        output_params["-g"] = args.gop
-        output_params["-force_key_frames"] = f"expr:gte(n,n_forced*{chunk_frames})"
-        if not args.use_av1:
-            output_params["-forced-idr"] = "1"
+print(f"Output Video Name: {vid_out_name}")
+print(f"Using persistent CUDA-direct TorchCodec/{'av1_nvenc' if args.use_av1 else 'h264_nvenc'} output.")
+from torchcodec.encoders import Encoder
 
-    if args.out_chunks:
-        output_params["-f"] = "segment"
-        output_params["-reset_timestamps"] = "1"
-        if args.frame_range is not None:
-            output_params["-segment_frames"] = segment_frames
-        else:
-            output_params["-segment_time"] = "10"
+maxrate = int(0.227 * w * h * args.fps)
+gop = args.gop if args.frame_range is not None and args.out_chunks else round(args.fps * 2)
+nvenc_options = {
+    "rc": "1",  # vbr
+    "cq": "24",
+    "maxrate": str((maxrate // 1_000_000) * 1_000_000),
+    "bufsize": str(((maxrate * 2) // 1_000_000) * 1_000_000),
+    "rc-lookahead": "48",
+    "spatial_aq": "1",
+    "temporal_aq": "1",
+    "aq-strength": "10",
+    "bf": "3",
+    "refs": "4",
+    "g": str(gop),
+    "b": "0",
+    "tune": "1",  # hq
+}
+if not args.use_av1:
+    nvenc_options["profile"] = "2"  # h264_nvenc: high
+if args.frame_range is not None and args.out_chunks:
+    nvenc_options["forced-idr"] = "1"
 
-    if args.output is not None:
-        vid_out_name = args.output
-    else:
-        # Assuming args.multi exists or is derived from args.fps / source_fps
-        multi = int(args.fps / source_fps) if source_fps else 1 
-        vid_out_name = '{}_{}X_{}fps.{}'.format(video_path_wo_ext, multi, int(np.round(args.fps)), args.ext)
-        
-    print(f"Output Video Name: {vid_out_name}")
-    # Initialize WriteGear. This can fail if the codec is truly unavailable.
-    vid_out = WriteGear(output=vid_out_name, logging=True, **output_params)
+encoded_path = f"{vid_out_name}.gpu-assembled.mp4" if args.out_chunks else vid_out_name
+video_encoder = Encoder()
+video_stream = video_encoder.add_video(
+    height=h,
+    width=w,
+    frame_rate=args.fps,
+    device="cuda",
+    codec="av1_nvenc" if args.use_av1 else "h264_nvenc",
+    preset=16,  # h264_nvenc/av1_nvenc: p5
+    extra_options=nvenc_options,
+)
+video_encoder.open_file(encoded_path)
+encode_buffer = []
 
-def clear_write_buffer(user_args, write_buffer):
-    cnt = 0
-    while True:
-        item = write_buffer.get()
-        if item is None:
-            break
-        if user_args.png:
-            cv2.imwrite('vid_out/{:0>7d}.png'.format(cnt), item[:, :, ::-1])
-            cnt += 1
-        else:
-            vid_out.write(item)  # Write the frame using VidGear
-            cnt += 1
+def encode_frame(frame):
+    encode_buffer.append(frame)
+    if len(encode_buffer) == 8:
+        flush_encoder()
+
+def flush_encoder():
+    if encode_buffer:
+        torch.cuda.synchronize()
+        video_stream.add_frames(torch.stack(encode_buffer))
+        encode_buffer.clear()
 
 def build_read_buffer(user_args, read_buffer, videogen):
     try:
@@ -491,35 +862,41 @@ def build_read_buffer(user_args, read_buffer, videogen):
     read_buffer.put(None)
 
 def pad_image(img):
-    if(args.fp16):
-        return F.pad(img, padding).half()
-    else:
-        return F.pad(img, padding)
+    return F.pad(img, padding).half().contiguous()
+
+def frame_to_tensor(frame):
+    rgb = np.ascontiguousarray(frame[:, :, ::-1])
+    img = torch.from_numpy(np.transpose(rgb, (2, 0, 1)))
+    img = img.to(device, non_blocking=True).unsqueeze(0).float() / 255.0
+    return pad_image(img)
 
 scale = 1
 
-tmp = max(128, int(128 / scale))
+tmp = max(args.pad_multiple, int(args.pad_multiple / scale))
 ph = ((h - 1) // tmp + 1) * tmp
 pw = ((w - 1) // tmp + 1) * tmp
 padding = (0, pw - w, 0, ph - h)
 pbar = tqdm(total=tot_frames)
-write_buffer = Queue(maxsize=125)
 read_buffer = Queue(maxsize=125)
 _thread.start_new_thread(build_read_buffer, (args, read_buffer, videogen))
-_thread.start_new_thread(clear_write_buffer, (args, write_buffer))
 
 I0 = None
-I1 = torch.from_numpy(np.transpose(lastframe, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
-I1 = pad_image(I1)
+I1 = frame_to_tensor(lastframe)
+if gpu_scene_detector is not None:
+    gpu_scene_detector.process_frame(I1, 0)
 temp = None # save lastframe when processing static frame
-time = 0
-output_index = 0
+time = float(decode_start)
+output_index = (
+    decode_start * ratio.numerator // ratio.denominator
+    if args.frame_range is not None
+    else 0
+)
 emitted_frames = 0
 
-idx_curr = 0
-idx_prev_unique = 0
-idx_last_unique = 0
-idx_prev_prev_unique = 0
+idx_curr = decode_start
+idx_prev_unique = decode_start
+idx_last_unique = decode_start
+idx_prev_prev_unique = max(0, decode_start - 1)
 
 last_unique_frame_64 = cv2.resize(cv2.cvtColor(lastframe, cv2.COLOR_BGR2GRAY), (64, 64), interpolation=cv2.INTER_AREA) if args.dedup else None
 dedup_skipped = 0
@@ -630,9 +1007,13 @@ while True:
             break
     else:
         idx_curr += 1
-        if live_scene_detector is not None and live_scene_detector.process_frame(frame, idx_curr):
-            scene_changes.add(idx_curr)
-            
+        next_I1 = None
+        if gpu_scene_detector is not None:
+            next_I1 = frame_to_tensor(frame)
+            gpu_cut = gpu_scene_detector.process_frame(next_I1, idx_curr)
+            if gpu_cut:
+                scene_changes.add(idx_curr)
+
         if args.dedup:
             frame_gray_64 = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (64, 64), interpolation=cv2.INTER_AREA)
             
@@ -655,10 +1036,12 @@ while True:
 
         Im1 = I0
         I0 = I1
-        I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
-        I1 = pad_image(I1)
-    
+        if next_I1 is None:
+            next_I1 = frame_to_tensor(frame)
+        I1 = next_I1
+
     output = []
+    batch_slots = []
     close_enough = 0.0001
     while range_start_output is not None and output_index < range_start_output and time <= idx_last_unique + close_enough:
         output_index += 1
@@ -677,7 +1060,7 @@ while True:
                     gap_prev = 1
                 extrap_factor = (time - idx_prev_unique) / gap_prev
                 
-                res = model.inference(Im1, I0, 1.0 + extrap_factor, scale)
+                res = run_inference(Im1, I0, 1.0 + extrap_factor, scale)
                 frame_type = 'extra'
         else:
             if d < close_enough:
@@ -690,22 +1073,62 @@ while True:
                 res = I0
                 frame_type = 'copy'
             else:
-                res = model.inference(I0, I1, d, scale)
+                res = None
                 frame_type = 'interp'
         
-        output.append((res, d, frame_type, time))
+        output.append([res, d, frame_type, time])
+        if res is None:
+            batch_slots.append((len(output) - 1, d))
         output_index += 1
         time = output_index * timestep if range_start_output is not None else time + timestep
 
+    for batch_start in range(0, len(batch_slots), args.batch_timestamps):
+        slots = batch_slots[batch_start:batch_start + args.batch_timestamps]
+        if len(slots) == 1:
+            slot, d = slots[0]
+            output[slot][0] = run_inference(I0, I1, d, scale)
+        else:
+            batch_size = len(slots)
+            timesteps = torch.tensor(
+                [d for _, d in slots],
+                device=I0.device,
+                dtype=I0.dtype,
+            ).view(batch_size, 1, 1, 1)
+            try:
+                batched = run_inference(
+                    I0.expand(batch_size, -1, -1, -1),
+                    I1.expand(batch_size, -1, -1, -1),
+                    timesteps,
+                    scale,
+                )
+                for batch_index, (slot, _) in enumerate(slots):
+                    output[slot][0] = batched[batch_index:batch_index + 1]
+            except torch.cuda.OutOfMemoryError:
+                del timesteps
+                torch.cuda.empty_cache()
+                print(
+                    f"Timestamp batch {batch_size} exceeded GPU memory; "
+                    "retrying those frames serially."
+                )
+                for slot, d in slots:
+                    output[slot][0] = run_inference(I0, I1, d, scale)
+
     emitted_frames += len(output)
     for res, d, frame_type, frame_time in output:
-        mid = ((res[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0))
-        cropped = mid[:h, :w]
-        
+        packed = res[0, :, :h, :w].mul(255.0).round_().clamp_(0, 255).to(torch.uint8)
         if args.debug:
-            cropped = draw_debug_visual(cropped, idx_prev_unique, idx_last_unique, d, frame_time, frame_type)
-        
-        write_buffer.put(cropped)
+            debug_frame = draw_debug_visual(
+                packed[[2, 1, 0]].cpu().numpy().transpose(1, 2, 0),
+                idx_prev_unique,
+                idx_last_unique,
+                d,
+                frame_time,
+                frame_type,
+            )
+            packed = torch.from_numpy(
+                np.ascontiguousarray(debug_frame[:, :, ::-1].transpose(2, 0, 1))
+            ).to(device)
+        encode_frame(packed.contiguous())
     
     pbar.update(idx_last_unique - idx_prev_unique)
     
@@ -717,23 +1140,38 @@ while True:
 
 range_error = None
 if args.frame_range is None:
-    write_buffer.put(lastframe)
+    encode_frame(
+        torch.from_numpy(
+            np.ascontiguousarray(lastframe[:, :, ::-1].transpose(2, 0, 1))
+        ).to(device)
+    )
 elif emitted_frames != expected_range_frames:
     range_error = RuntimeError(
         f"range produced {emitted_frames} frames; expected {expected_range_frames}. "
         "The END boundary is past the decodable source timeline."
     )
-write_buffer.put(None)
-
-import time
-while(not write_buffer.empty()):
-    time.sleep(0.1)
+flush_encoder()
+video_encoder.close()
+if args.out_chunks:
+    segment_args = [
+        "ffmpeg", "-y", "-loglevel", "error", "-i", encoded_path,
+        "-map", "0:v:0", "-c", "copy", "-f", "segment",
+        "-reset_timestamps", "1",
+    ]
+    if args.frame_range is not None:
+        segment_args += ["-segment_frames", segment_frames]
+    else:
+        segment_args += ["-segment_time", "10"]
+    output_path = Path(vid_out_name)
+    chunk_pattern = vid_out_name if "%" in output_path.name else str(
+        output_path.with_name(f"{output_path.stem}_%03d{output_path.suffix}")
+    )
+    subprocess.run(segment_args + [chunk_pattern], check=True)
+    Path(encoded_path).unlink()
 pbar.close()
 if args.dedup:
     print(f"Dedup: skipped {dedup_skipped} duplicate frames.")
-if live_scene_detector is not None:
-    print(f"Detected {len(scene_changes)} scene changes via live hash.\n{scene_changes}")
-if not vid_out is None:
-    vid_out.close()
+if gpu_scene_detector is not None:
+    print(f"Detected {len(scene_changes)} scene changes via live GPU hash.\n{scene_changes}")
 if range_error is not None:
     raise range_error

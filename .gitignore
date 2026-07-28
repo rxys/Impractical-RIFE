@@ -4,7 +4,6 @@
 
 *.pkl
 output/*
-train_log/*
 *.mp4
 
 test/
@@ -12,3 +11,5 @@ test/
 *.npz
 
 *.zip
+AGENTS.md
+.vscode/
