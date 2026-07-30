@@ -12,7 +12,7 @@ _info, _original_cores, _cache_hit = {}, {}, False
 
 _CACHE_VERSION = 4
 _TORCH_TRT_VERSION = "2.11.0"
-_TENSORRT_VERSION = "10.14.1.48"
+_TENSORRT_VERSION = "10.14.1.48.post1"
 _VAPOURSYNTH_VERSION = "77"
 _VSRIFE_VERSION = "5.7.0"
 _TORCHCODEC_VERSION = "0.13.0+cu126"
