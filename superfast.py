@@ -8,18 +8,29 @@ __all__ = ["load", "save"]
 _root, _cores = Path("/content/smoothie-trt"), Path("/content/vs_rife_benchmark/engines-flow-v2")
 _ready = _root / "inference-ready"
 _token = _remote = _tag = None
-_info, _original_cores, _cache_hit = {}, set(), False
+_info, _original_cores, _cache_hit = {}, {}, False
+
+_CACHE_VERSION = 4
+_TORCH_TRT_VERSION = "2.11.0"
+_TENSORRT_VERSION = "10.14.1.48"
+_VAPOURSYNTH_VERSION = "77"
+_VSRIFE_VERSION = "5.7.0"
+_TORCHCODEC_VERSION = "0.13.0+cu126"
 
 
 def _identity():
     import torch
     info = dict(
-        version=3,
+        version=_CACHE_VERSION,
         python=f"{sys.version_info.major}.{sys.version_info.minor}",
         torch=torch.__version__,
         cuda=torch.version.cuda,
         gpu=torch.cuda.get_device_name(0),
         capability=list(torch.cuda.get_device_capability(0)),
+        torch_tensorrt=_TORCH_TRT_VERSION,
+        tensorrt=_TENSORRT_VERSION,
+        vapoursynth=_VAPOURSYNTH_VERSION,
+        vsrife=_VSRIFE_VERSION,
     )
     tag = hashlib.sha256(json.dumps(info, sort_keys=True).encode()).hexdigest()[:16]
     return info, tag
@@ -41,23 +52,33 @@ def _deactivate():
         )
 
 
+def _installed_version(name):
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
 def _install_builder():
     _deactivate()
-    py = [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir"]
-    try:
-        codec_ready = importlib.metadata.version("torchcodec") == "0.13.0+cu126"
-    except importlib.metadata.PackageNotFoundError:
-        codec_ready = False
-    if not codec_ready:
+    py = [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--upgrade"]
+    if _installed_version("torchcodec") != _TORCHCODEC_VERSION:
         subprocess.run(py + ["--no-deps",
             "https://download.pytorch.org/whl/cu126/"
             "torchcodec-0.13.0%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl"], check=True)
-    if all(importlib.util.find_spec(name) for name in ("torch_tensorrt", "vapoursynth", "vsrife")):
+    expected = {
+        "torch-tensorrt": _TORCH_TRT_VERSION,
+        "tensorrt-cu12": _TENSORRT_VERSION,
+        "vapoursynth": _VAPOURSYNTH_VERSION,
+        "vsrife": _VSRIFE_VERSION,
+    }
+    if all(_installed_version(name) == version for name, version in expected.items()):
         return
-    subprocess.run(py + ["--no-deps", "torch-tensorrt==2.11.0",
+    subprocess.run(py + ["--no-deps", f"torch-tensorrt=={_TORCH_TRT_VERSION}",
                    "--extra-index-url", "https://download.pytorch.org/whl/cu128"], check=True)
-    subprocess.run(py + ["tensorrt-cu12>=10.15.1,<10.16", "vapoursynth==77",
-                   "vsrife==5.7.0", "vidgear", "dllist",
+    subprocess.run(py + [f"tensorrt-cu12=={_TENSORRT_VERSION}",
+                   f"vapoursynth=={_VAPOURSYNTH_VERSION}",
+                   f"vsrife=={_VSRIFE_VERSION}", "vidgear", "dllist",
                    "--extra-index-url", "https://pypi.nvidia.com"], check=True)
     subprocess.run(["vapoursynth", "config"], check=True)
 
@@ -96,7 +117,7 @@ def load(token=None, bucket_name=None):
     _ready.unlink(missing_ok=True)
     os.environ["SMOOTHIE_CACHE_READY"] = str(_ready)
     _info, _tag = _identity()
-    _remote = f"hf://buckets/{bucket_name}/smoothie/trt-bundles/v1/{_tag}.zip"
+    _remote = f"hf://buckets/{bucket_name}/smoothie/trt-bundles/v2/{_tag}.zip"
     archive = Path(f"/content/smoothie-trt-{_tag}.zip")
     result = _hf(_remote, archive, check=False)
     _cache_hit = result.returncode == 0
@@ -104,16 +125,26 @@ def load(token=None, bucket_name=None):
         print("No compatible cache; installing the TensorRT builder once.")
         _install_builder()
         return
-    shutil.rmtree(_root, ignore_errors=True)
-    with zipfile.ZipFile(archive) as z:
-        z.extractall(_root)
-    archive.unlink()
-    if json.loads((_root / "compatibility.json").read_text()) != _info:
-        raise RuntimeError("Incompatible TensorRT cache")
+    try:
+        shutil.rmtree(_root, ignore_errors=True)
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(_root)
+        archive.unlink()
+        if json.loads((_root / "compatibility.json").read_text()) != _info:
+            raise RuntimeError("Incompatible TensorRT cache")
+    except Exception as error:
+        print(f"Ignoring unusable TensorRT cache: {error}")
+        archive.unlink(missing_ok=True)
+        shutil.rmtree(_root, ignore_errors=True)
+        _root.mkdir(parents=True, exist_ok=True)
+        _cache_hit = False
+        _install_builder()
+        return
+    shutil.rmtree(_cores, ignore_errors=True)
     _cores.mkdir(parents=True, exist_ok=True)
     for source in (_root / "engines").glob("*"):
         shutil.copy2(source, _cores / source.name)
-    _original_cores = {p.name for p in _cores.glob("*")}
+    _original_cores = {p.name: p.stat().st_size for p in _cores.glob("*") if p.stat().st_size}
     _activate()
     print(f"TensorRT cache restored ({len(_original_cores)} core files).")
 
@@ -160,11 +191,15 @@ def save():
     current = {p.name: p.stat().st_size for p in _cores.glob("*") if p.stat().st_size}
     if not any(name.endswith(".encode") for name in current):
         raise RuntimeError("Inference started without a complete TensorRT core")
-    if _cache_hit and set(current) == _original_cores:
+    if _cache_hit and current == _original_cores:
         return
-    if not (_root / "runtime").is_dir():
-        _copy_runtime()
+    # Engines may have just been rebuilt after restoring an older cache. Always
+    # package the runtime currently installed beside those engines; retaining
+    # the restored runtime can create a mixed, non-deserializable archive.
+    shutil.rmtree(_root / "runtime", ignore_errors=True)
+    _copy_runtime()
     engines = _root / "engines"
+    shutil.rmtree(engines, ignore_errors=True)
     engines.mkdir(parents=True, exist_ok=True)
     for source in _cores.glob("*"):
         shutil.copy2(source, engines / source.name)

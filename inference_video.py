@@ -248,6 +248,7 @@ torch.backends.cudnn.benchmark = True
 
 flow_engine = None
 encode_engine = None
+engine_rebuild_attempted = False
 ten_flow_div = None
 warp_grid = None
 timestamp_tensors = {}
@@ -292,7 +293,7 @@ def trt_forward_with_flow(self, img0, img1, timestep, flow_div, warp_grid, f0, f
     return warped0 * mask + warped1 * (1 - mask), flow
 
 def ensure_vsrife_engines(img0, img1):
-    global flow_engine, encode_engine, ten_flow_div, warp_grid
+    global flow_engine, encode_engine, ten_flow_div, warp_grid, engine_rebuild_attempted
     if flow_engine is not None:
         return
 
@@ -429,8 +430,25 @@ def ensure_vsrife_engines(img0, img1):
     encode_path = Path(str(flow_path) + ".encode")
     assert encode_path.is_file(), f"Missing VS-RIFE encode engine: {encode_path}"
 
-    flow_engine = torch.jit.load(str(flow_path)).eval()
-    encode_engine = torch.jit.load(str(encode_path)).eval()
+    try:
+        flow_engine = torch.jit.load(str(flow_path)).eval()
+        encode_engine = torch.jit.load(str(encode_path)).eval()
+    except RuntimeError as error:
+        text = str(error).lower()
+        stale = "deserialize" in text or "engine plan file is not compatible" in text
+        if not stale or engine_rebuild_attempted:
+            raise
+        engine_rebuild_attempted = True
+        flow_engine = encode_engine = None
+        print(f"[trt] cached engine is incompatible; rebuilding once: {error}", flush=True)
+        flow_path.unlink(missing_ok=True)
+        encode_path.unlink(missing_ok=True)
+        try:
+            import superfast
+            superfast._install_builder()
+        except ImportError:
+            pass
+        return ensure_vsrife_engines(img0, img1)
     ten_flow_div = torch.tensor(
         [(padded_width - 1.0) / 2.0, (padded_height - 1.0) / 2.0],
         device=device,
