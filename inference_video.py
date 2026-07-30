@@ -9,9 +9,10 @@ import numpy as np
 from tqdm import tqdm
 from torch.nn import functional as F
 import warnings
-import _thread
+import atexit
+import threading
 import subprocess
-from queue import Queue
+from queue import Full, Queue
 from vidgear.gears import VideoGear
 import math
 import time as walltime
@@ -863,21 +864,32 @@ def flush_encoder():
         video_stream.add_frames(torch.stack(encode_buffer))
         encode_buffer.clear()
 
-def build_read_buffer(user_args, read_buffer, videogen):
+def build_read_buffer(user_args, read_buffer, videogen, stop_event, error_box):
     try:
         frame_index = 0
-        while True:
+        while not stop_event.is_set():
             frame = videogen.read()
             if frame is None:
                 break
             if args.fixed_height is not None:
                 frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
             if frame_index % user_args.drop_input == 0:
-                read_buffer.put(frame)
+                while not stop_event.is_set():
+                    try:
+                        read_buffer.put(frame, timeout=0.1)
+                        break
+                    except Full:
+                        continue
             frame_index += 1
-    except:
-        pass
-    read_buffer.put(None)
+    except BaseException as error:
+        error_box[0] = error
+    finally:
+        while not stop_event.is_set():
+            try:
+                read_buffer.put(None, timeout=0.1)
+                break
+            except Full:
+                continue
 
 def pad_image(img):
     return F.pad(img, padding).half().contiguous()
@@ -894,9 +906,42 @@ tmp = max(args.pad_multiple, int(args.pad_multiple / scale))
 ph = ((h - 1) // tmp + 1) * tmp
 pw = ((w - 1) // tmp + 1) * tmp
 padding = (0, pw - w, 0, ph - h)
-pbar = tqdm(total=tot_frames)
+progress_total = range_end - decode_start if args.frame_range is not None else tot_frames
+pbar = tqdm(total=progress_total)
 read_buffer = Queue(maxsize=125)
-_thread.start_new_thread(build_read_buffer, (args, read_buffer, videogen))
+read_stop = threading.Event()
+read_error = [None]
+read_thread = threading.Thread(
+    target=build_read_buffer,
+    args=(args, read_buffer, videogen, read_stop, read_error),
+    name="smoothie-frame-reader",
+    daemon=True,
+)
+read_thread.start()
+
+decoder_stopped = False
+
+def stop_decoder():
+    global decoder_stopped
+    if decoder_stopped:
+        return
+    decoder_stopped = True
+    read_stop.set()
+
+    # Ranged jobs stop consuming long before the full video is decoded. The old
+    # raw _thread then remained blocked on this queue while VideoGear's native
+    # decoder thread was still alive, causing std::terminate at interpreter exit.
+    read_thread.join(timeout=2.0)
+    try:
+        videogen.stop()
+    except Exception as error:
+        print(f"[decode] warning: VideoGear stop failed: {error}", flush=True)
+    read_thread.join(timeout=8.0)
+    if read_thread.is_alive():
+        print("[decode] warning: frame reader did not stop cleanly", flush=True)
+
+# Also clean up on an unrelated exception before the normal shutdown point.
+atexit.register(stop_decoder)
 
 I0 = None
 I1 = frame_to_tensor(lastframe)
@@ -1006,6 +1051,8 @@ while True:
         
     is_eof = False
     if frame is None:
+        if read_error[0] is not None:
+            raise RuntimeError("Background video decoder failed") from read_error[0]
         decoded_all_frames = idx_curr + 1 == int(round(tot_frames))
         if (
             range_end_output is not None
@@ -1155,6 +1202,10 @@ while True:
         
     if (range_end_output is not None and output_index >= range_end_output) or is_eof:
         break
+
+# Stop all decoder threads before encoder finalization and interpreter teardown.
+stop_decoder()
+atexit.unregister(stop_decoder)
 
 range_error = None
 if args.frame_range is None:
