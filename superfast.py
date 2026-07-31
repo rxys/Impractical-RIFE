@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import Any, Sequence
@@ -56,6 +57,7 @@ _engine_operation_completed = False
 _engine_operation_source: str | None = None
 _engine_completed_source: str | None = None
 _engine_error: BaseException | None = None
+_engine_requests_pending = 0
 
 
 def _workspace() -> Path:
@@ -349,6 +351,27 @@ def _finish_engine_operation(error: BaseException | None = None) -> None:
         _state.notify_all()
 
 
+def _begin_prebuild_request() -> None:
+    global _engine_requests_pending
+    with _state:
+        _engine_requests_pending += 1
+        _state.notify_all()
+
+
+def _finish_prebuild_request() -> None:
+    global _engine_requests_pending
+    with _state:
+        _engine_requests_pending = max(0, _engine_requests_pending - 1)
+        _state.notify_all()
+
+
+def _run_requested_prebuild(width: int, height: int, pad_multiple: int) -> None:
+    try:
+        _prebuild(width, height, pad_multiple)
+    finally:
+        _finish_prebuild_request()
+
+
 def _prebuild(width: int, height: int, pad_multiple: int) -> None:
     _begin_engine_operation("load")
     error: BaseException | None = None
@@ -455,8 +478,16 @@ def load(
     pad_multiple: int = 64,
 ) -> None:
     """Restore dependencies and optionally prepare the engine for video dimensions."""
+    if (width is None) != (height is None):
+        raise ValueError("width and height must be provided together")
+    if width is not None and (int(width) <= 0 or int(height) <= 0):
+        raise ValueError("width and height must be greater than zero")
+
     if not _claim_load():
         wait_for_load()
+        if width is not None:
+            _begin_prebuild_request()
+            _run_requested_prebuild(int(width), int(height), int(pad_multiple))
         return
 
     error: BaseException | None = None
@@ -477,19 +508,42 @@ def start_load(
     height: int | None = None,
     pad_multiple: int = 64,
 ) -> concurrent.futures.Future[None]:
-    """Start ``load`` in a daemon thread and return a Future for synchronization."""
+    """Start cache loading/prebuilding and return a Future for synchronization."""
     future: concurrent.futures.Future[None] = concurrent.futures.Future()
+    if (width is None) != (height is None):
+        future.set_exception(ValueError("width and height must be provided together"))
+        return future
+    if width is not None and (int(width) <= 0 or int(height) <= 0):
+        future.set_exception(ValueError("width and height must be greater than zero"))
+        return future
 
     if not _claim_load():
+        if width is not None:
+            # Publish the pending request before the thread starts. A concurrent
+            # save() must not package an older engine set in this small gap.
+            _begin_prebuild_request()
+
         def wait_existing() -> None:
+            prebuild_entered = False
             try:
                 wait_for_load()
+                if width is not None:
+                    prebuild_entered = True
+                    _run_requested_prebuild(
+                        int(width), int(height), int(pad_multiple)
+                    )
             except BaseException as error:
+                if width is not None and not prebuild_entered:
+                    _finish_prebuild_request()
                 future.set_exception(error)
             else:
                 future.set_result(None)
 
-        threading.Thread(target=wait_existing, name="smoothie-load-wait", daemon=True).start()
+        threading.Thread(
+            target=wait_existing,
+            name="smoothie-load-wait",
+            daemon=True,
+        ).start()
         return future
 
     # Bind cwd and publish the engine path before the worker can race with the
@@ -574,6 +628,9 @@ def _wait_until_saveable() -> None:
                 raise _load_error
 
         while True:
+            if _engine_requests_pending:
+                _state.wait()
+                continue
             if _engine_error is not None:
                 raise _engine_error
             if _inference_error is not None and not _engine_operation_completed:
@@ -617,6 +674,7 @@ def save() -> None:
     """Upload changed engines once the sole engine load/build phase is stable."""
     global _original_cores
 
+    requested_at = time.perf_counter()
     _wait_until_saveable()
     if not _remote or not _tag:
         return
@@ -628,6 +686,8 @@ def save() -> None:
     if _cache_hit and current == _original_cores:
         return
 
+    print("[trt-cache] packaging started", flush=True)
+    packaging_started = time.perf_counter()
     root = _workspace()
     # Copy before replacing the managed runtime so active cached packages can
     # still be used as sources if no builder installation was necessary.
@@ -658,8 +718,21 @@ def save() -> None:
                     bundle.write(path, Path("engines") / path.name)
             bundle.write(compatibility, compatibility.name)
         size_mib = archive.stat().st_size / 2**20
+        packaging_seconds = time.perf_counter() - packaging_started
+        print(
+            f"[trt-cache] upload started ({size_mib:.1f} MiB; "
+            f"packaged in {packaging_seconds:.1f}s)",
+            flush=True,
+        )
+        upload_started = time.perf_counter()
         _hf(archive, _remote)
+        upload_seconds = time.perf_counter() - upload_started
+        total_seconds = time.perf_counter() - requested_at
         _original_cores = current
-        print(f"TensorRT cache saved ({size_mib:.1f} MiB).")
+        print(
+            f"TensorRT cache saved ({size_mib:.1f} MiB; upload "
+            f"{upload_seconds:.1f}s; total {total_seconds:.1f}s).",
+            flush=True,
+        )
     finally:
         archive.unlink(missing_ok=True)
