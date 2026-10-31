@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import ctypes
 import hashlib
 import importlib
 import importlib.metadata
@@ -82,9 +83,20 @@ def _engine_dir(*, reset_to_workspace: bool = False) -> Path:
     return _cores
 
 
+def _configure_versions() -> str:
+    """Use wheels for the Torch/CUDA stack already supplied by the VM."""
+    import torch
+    global _TORCH_TRT_VERSION, _TORCHCODEC_VERSION
+    cuda = "cu130" if torch.version.cuda.startswith("13.") else "cu129"
+    _TORCH_TRT_VERSION = ".".join(torch.__version__.split(".")[:2]) + ".0+" + cuda
+    _TORCHCODEC_VERSION = "0.13.0+" + cuda
+    return cuda
+
+
 def _identity() -> tuple[dict[str, Any], str]:
     import torch
 
+    _configure_versions()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     info = dict(
@@ -141,52 +153,40 @@ def _installed_version(name: str) -> str | None:
 
 
 def _install_builder() -> None:
-    """Install compiler-time dependencies when a matching engine is absent."""
+    """Install missing compiler packages without replacing the VM's Torch stack."""
     _deactivate()
-    py = [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--upgrade"]
-    if _installed_version("torchcodec") != _TORCHCODEC_VERSION:
-        subprocess.run(
-            py
-            + [
-                "--no-deps",
-                f"torchcodec=={_TORCHCODEC_VERSION}",
-                "--extra-index-url",
-                "https://download.pytorch.org/whl/cu126",
-            ],
-            check=True,
-        )
-    expected = {
+    cuda = _configure_versions()
+    py = [sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--no-cache-dir"]
+    wheels = {
+        "torchcodec": _TORCHCODEC_VERSION,
         "torch-tensorrt": _TORCH_TRT_VERSION,
+    }
+    missing = [f"{name}=={version}" for name, version in wheels.items()
+               if _installed_version(name) != version]
+    if missing:
+        subprocess.run(py + missing + ["--index-url", "https://download.pytorch.org/whl/" + cuda], check=True)
+    packages = {
         "tensorrt-cu12": _TENSORRT_VERSION,
+        "tensorrt-cu12-bindings": _TENSORRT_VERSION,
+        "tensorrt-cu12-libs": _TENSORRT_VERSION,
         "vapoursynth": _VAPOURSYNTH_VERSION,
         "vsrife": _VSRIFE_VERSION,
+        "vidgear": None,
+        "colorlog": None,
+        "dllist": None,
+        "numpy": None,
+        "requests": None,
+        "tqdm": None,
     }
-    if all(_installed_version(name) == version for name, version in expected.items()):
-        return
-    subprocess.run(
-        py
-        + [
-            "--no-deps",
-            f"torch-tensorrt=={_TORCH_TRT_VERSION}",
-            "--extra-index-url",
-            "https://download.pytorch.org/whl/cu128",
-        ],
-        check=True,
-    )
-    subprocess.run(
-        py
-        + [
-            f"tensorrt-cu12=={_TENSORRT_VERSION}",
-            f"vapoursynth=={_VAPOURSYNTH_VERSION}",
-            f"vsrife=={_VSRIFE_VERSION}",
-            "vidgear",
-            "dllist",
-            "--extra-index-url",
-            "https://pypi.nvidia.com",
-        ],
-        check=True,
-    )
-    subprocess.run(["vapoursynth", "config"], check=True)
+    configure_vapoursynth = _installed_version("vapoursynth") != _VAPOURSYNTH_VERSION
+    missing = [name + ("==" + version if version else "")
+               for name, version in packages.items()
+               if _installed_version(name) is None or
+                  (version is not None and _installed_version(name) != version)]
+    if missing:
+        subprocess.run(py + missing + ["--extra-index-url", "https://pypi.nvidia.com"], check=True)
+    if configure_vapoursynth:
+        subprocess.run(["vapoursynth", "config"], check=True)
     importlib.invalidate_caches()
 
 
@@ -237,6 +237,16 @@ def _activate() -> None:
     os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
         [*sorted(libraries), *[entry for entry in current_ld if entry not in libraries]]
     )
+    # LD_LIBRARY_PATH changes cannot update the running ELF loader. Load the
+    # VM-provided CUDA libraries explicitly instead of copying/installing them.
+    entries = dict.fromkeys([*package_texts, *sys.path])
+    for folder, library in (("cuda_runtime", "libcudart"), ("cuda_nvrtc", "libnvrtc")):
+        for major in (12, 13):
+            for entry in entries:
+                path = Path(entry) / "nvidia" / folder / "lib" / f"{library}.so.{major}"
+                if path.is_file():
+                    ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+                    break
     importlib.invalidate_caches()
 
 
@@ -434,6 +444,20 @@ def _load_impl(
         return
 
     _remote = f"hf://buckets/{bucket_name}/smoothie/trt-bundles/v2/{_tag}.zip"
+    compatibility = root / "compatibility.json"
+    manifest = root / "cached-cores.json"
+    if compatibility.exists() and (root / "runtime").is_dir():
+        try:
+            if json.loads(compatibility.read_text()) == _info:
+                _activate()
+                _cache_hit = True
+                _original_cores = json.loads(manifest.read_text()) if manifest.exists() else {}
+                print(f"TensorRT local cache reused ({len(_snapshot_cores())} core files).")
+                if width is not None and height is not None:
+                    _prebuild(width, height, pad_multiple)
+                return
+        except Exception as error:
+            print(f"Ignoring unusable local TensorRT cache: {error}")
     archive = root / f"smoothie-trt-{_tag}.zip"
     result = _hf(_remote, archive, check=False)
     _cache_hit = result.returncode == 0
@@ -464,6 +488,7 @@ def _load_impl(
     cores.mkdir(parents=True, exist_ok=True)
     _original_cores = _snapshot_cores()
     if _cache_hit:
+        manifest.write_text(json.dumps(_original_cores))
         print(f"TensorRT cache restored ({len(_original_cores)} core files).")
     if width is not None and height is not None:
         _prebuild(width, height, pad_multiple)
@@ -572,12 +597,12 @@ def start_load(
     return future
 
 
-def run_inference(argv: Sequence[str] | None = None) -> Any:
+def run_inference(argv: Sequence[str] | None = None, *, reader=None) -> Any:
     """Wait for cache loading, then run inference in the foreground."""
     wait_for_load()
     import inference_video
 
-    return inference_video.main(argv)
+    return inference_video.main(argv, reader=reader)
 
 
 def _copy_runtime(runtime: Path | None = None) -> None:
@@ -603,6 +628,8 @@ def _copy_runtime(runtime: Path | None = None) -> None:
                 ".hpp",
                 ".a",
             }
+            if name == "torch-tensorrt":
+                skip = source.name not in {"libtorchtrt_runtime.so", "libtorchtrt_plugins.so"}
             if not source.is_file() or skip:
                 continue
             resolved = source.resolve()
@@ -729,6 +756,7 @@ def save() -> None:
         upload_seconds = time.perf_counter() - upload_started
         total_seconds = time.perf_counter() - requested_at
         _original_cores = current
+        (root / "cached-cores.json").write_text(json.dumps(current))
         print(
             f"TensorRT cache saved ({size_mib:.1f} MiB; upload "
             f"{upload_seconds:.1f}s; total {total_seconds:.1f}s).",

@@ -356,28 +356,32 @@ def trt_forward_with_flow(self, img0, img1, timestep, flow_div, warp_grid, f0, f
 
 
 def _runtime_search_entries():
-    entries = {
+    entries = list(dict.fromkeys(
         Path(entry).resolve()
         for entry in [*sys.path, *os.environ.get("PYTHONPATH", "").split(os.pathsep)]
         if entry and Path(entry).is_dir()
-    }
+    ))
     runtime_spec = importlib.util.find_spec("torch_tensorrt")
     if runtime_spec and runtime_spec.submodule_search_locations:
-        entries.update(Path(entry).parent.resolve() for entry in runtime_spec.submodule_search_locations)
+        for entry in runtime_spec.submodule_search_locations:
+            parent = Path(entry).parent.resolve()
+            if parent not in entries:
+                entries.append(parent)
     return entries
 
 
 def _load_torch_tensorrt_runtime():
     runtime_entries = _runtime_search_entries()
-    runtime_libraries = [
-        path
-        for entry in runtime_entries
-        for path in (
-            entry / "torch_tensorrt" / "lib" / "libtorchtrt_runtime.so",
-            entry / "torch_tensorrt" / "lib" / "libtorchtrt_plugins.so",
-        )
-        if path.is_file()
-    ]
+    runtime_libraries = []
+    # The cache and an installed compiler can both provide these libraries.
+    # Loading both registers the same Torch class twice and aborts the process.
+    for entry in runtime_entries:
+        folder = entry / "torch_tensorrt" / "lib"
+        if (folder / "libtorchtrt_runtime.so").is_file():
+            runtime_libraries = [folder / name for name in
+                                 ("libtorchtrt_runtime.so", "libtorchtrt_plugins.so")
+                                 if (folder / name).is_file()]
+            break
     if not runtime_libraries:
         raise RuntimeError("Torch-TensorRT runtime libraries were not found")
 
@@ -388,9 +392,12 @@ def _load_torch_tensorrt_runtime():
             entry / "tensorrt_cu12_libs",
             entry / "nvidia" / "tensorrt" / "lib",
         ):
-            if folder.is_dir():
-                native_libraries.extend(folder.glob("libnvinfer.so*"))
-                native_libraries.extend(folder.glob("libnvinfer_plugin.so*"))
+            core = list(folder.glob("libnvinfer.so*"))
+            if core:
+                native_libraries = core + list(folder.glob("libnvinfer_plugin.so*"))
+                break
+        if native_libraries:
+            break
     for library in sorted(set(native_libraries), key=lambda path: "plugin" in path.name):
         ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
     for library in runtime_libraries:
@@ -689,18 +696,18 @@ def run_inference(img0, img1, timestep, inference_scale=1):
     return result
 
 
-def _main(argv=None):
+def _main(argv=None, reader=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     _validate_args(parser, args)
     _wait_for_superfast_load()
     _configure_cuda()
     from vidgear.gears import VideoGear
-    videoCapture = cv2.VideoCapture(args.video)
-    source_fps = videoCapture.get(cv2.CAP_PROP_FPS) / args.drop_input
+    videoCapture = cv2.VideoCapture(args.video) if reader is None else None
+    source_fps = (videoCapture.get(cv2.CAP_PROP_FPS) if reader is None else reader.fps) / args.drop_input
     timestep = source_fps / args.fps
-    tot_frames = videoCapture.get(cv2.CAP_PROP_FRAME_COUNT)
-    videoCapture.release()
+    tot_frames = videoCapture.get(cv2.CAP_PROP_FRAME_COUNT) if reader is None else reader.frames
+    if videoCapture is not None:videoCapture.release()
 
     range_start_output = range_end_output = expected_range_frames = None
     chunk_frames = segment_frames = None
@@ -731,7 +738,9 @@ def _main(argv=None):
         f"for range {args.frame_range}",
         flush=True,
     )
-    videogen = VideoGear(
+    if reader is not None and (reader.video != args.video or reader.start_frame != decode_start or reader.end_frame != args.frame_range[1]):
+        raise ValueError('Prepared decoder does not match the assigned range')
+    videogen = reader if reader is not None else VideoGear(
         source=args.video,
         backend='ffmpeg',
         **({"CAP_PROP_POS_FRAMES": decode_start} if decode_start else {}),
@@ -1394,12 +1403,12 @@ def _main(argv=None):
     return vid_out_name
 
 
-def main(argv=None):
+def main(argv=None, reader=None):
     coordinator = _superfast_coordinator()
     if coordinator is not None:
         coordinator._notify_inference_started()
     try:
-        return _main(argv)
+        return _main(argv, reader=reader)
     except BaseException as error:
         if coordinator is not None:
             coordinator._notify_inference_failed(error)
