@@ -2,6 +2,7 @@ import re
 import os
 import sys
 import ctypes
+import json
 import importlib.util
 import cv2
 import torch
@@ -696,6 +697,29 @@ def run_inference(img0, img1, timestep, inference_scale=1):
     return result
 
 
+def get_vid_fps_dim(path):
+    def read(args):
+        return json.loads(subprocess.check_output(['ffprobe','-v','error','-select_streams','v:0',*args,'-of','json',str(path)],text=True))
+    info=read(['-show_entries','stream=width,height,nb_frames,duration,start_time,time_base:format=duration'])
+    s=info['streams'][0]
+    n=int(s.get('nb_frames') or 0)
+    if not n:
+        counted=read(['-count_packets','-show_entries','stream=nb_read_packets'])
+        n=int(counted['streams'][0]['nb_read_packets'])
+    duration=float(s.get('duration') or info.get('format',{}).get('duration') or 0)
+    start=float(s.get('start_time') or 0)
+    packets=read(['-read_intervals',f'%+#32,{max(start,start+duration-2):.6f}%',
+                  '-show_packets','-show_entries','packet=pts,duration'])['packets']
+    packets=[p for p in packets if 'pts' in p]
+    first=min(p['pts'] for p in packets);last=max(packets,key=lambda p:p['pts'])
+    base=Fraction(s['time_base'])
+    if n<2 or last['pts']<=first:raise ValueError('Video frame timing is unavailable')
+    # CFR: N-1 intervals between the first and last real frames.
+    fps=Fraction(n-1,1)/(base*(last['pts']-first))
+    return dict(fps=float(fps),frames=n,duration=float(Fraction(n,1)/fps),
+                width=int(s['width']),height=int(s['height']))
+
+
 def _main(argv=None, reader=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -703,11 +727,12 @@ def _main(argv=None, reader=None):
     _wait_for_superfast_load()
     _configure_cuda()
     from vidgear.gears import VideoGear
-    videoCapture = cv2.VideoCapture(args.video) if reader is None else None
-    source_fps = (videoCapture.get(cv2.CAP_PROP_FPS) if reader is None else reader.fps) / args.drop_input
+    if reader is None:
+        source = get_vid_fps_dim(args.video)
+        source_fps, tot_frames = source['fps'] / args.drop_input, source['frames']
+    else:
+        source_fps, tot_frames = reader.fps / args.drop_input, reader.frames
     timestep = source_fps / args.fps
-    tot_frames = videoCapture.get(cv2.CAP_PROP_FRAME_COUNT) if reader is None else reader.frames
-    if videoCapture is not None:videoCapture.release()
 
     range_start_output = range_end_output = expected_range_frames = None
     chunk_frames = segment_frames = None

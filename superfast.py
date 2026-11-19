@@ -28,9 +28,8 @@ __all__ = [
 
 ENGINE_DIR_ENV = "SMOOTHIE_ENGINE_DIR"
 
-_CACHE_VERSION = 5
+_CACHE_VERSION = 6
 _TORCH_TRT_VERSION = "2.11.0"
-_TENSORRT_VERSION = "10.14.1.48.post1"
 _VAPOURSYNTH_VERSION = "77"
 _VSRIFE_VERSION = "5.7.0"
 _TORCHCODEC_VERSION = "0.13.0+cu126"
@@ -107,7 +106,7 @@ def _identity() -> tuple[dict[str, Any], str]:
         gpu=torch.cuda.get_device_name(0),
         capability=list(torch.cuda.get_device_capability(0)),
         torch_tensorrt=_TORCH_TRT_VERSION,
-        tensorrt=_TENSORRT_VERSION,
+        tensorrt="torch-tensorrt-wheel-requirements",
         vapoursynth=_VAPOURSYNTH_VERSION,
         vsrife=_VSRIFE_VERSION,
     )
@@ -166,9 +165,6 @@ def _install_builder() -> None:
     if missing:
         subprocess.run(py + missing + ["--index-url", "https://download.pytorch.org/whl/" + cuda], check=True)
     packages = {
-        "tensorrt-cu12": _TENSORRT_VERSION,
-        "tensorrt-cu12-bindings": _TENSORRT_VERSION,
-        "tensorrt-cu12-libs": _TENSORRT_VERSION,
         "vapoursynth": _VAPOURSYNTH_VERSION,
         "vsrife": _VSRIFE_VERSION,
         "vidgear": None,
@@ -183,6 +179,18 @@ def _install_builder() -> None:
                for name, version in packages.items()
                if _installed_version(name) is None or
                   (version is not None and _installed_version(name) != version)]
+    # The matching Torch-TensorRT wheel declares its CUDA/ABI requirements.
+    # Keep --no-deps so installing the builder never replaces the VM's Torch.
+    from packaging.requirements import Requirement
+    for raw in importlib.metadata.requires("torch-tensorrt") or ():
+        requirement=Requirement(raw)
+        if not requirement.name.lower().startswith("tensorrt"):
+            continue
+        if requirement.marker and not requirement.marker.evaluate({"extra":""}):
+            continue
+        installed=_installed_version(requirement.name)
+        if installed is None or installed not in requirement.specifier:
+            missing.append(str(requirement))
     if missing:
         subprocess.run(py + missing + ["--extra-index-url", "https://pypi.nvidia.com"], check=True)
     if configure_vapoursynth:
@@ -209,11 +217,9 @@ def _activate() -> None:
         str(path.parent.resolve())
         for pattern in (
             "runtime/**/site-packages/nvidia/**/lib*.so*",
-            "runtime/**/site-packages/tensorrt_libs/lib*.so*",
-            "runtime/**/site-packages/tensorrt_cu12_libs/lib*.so*",
+            "runtime/**/site-packages/tensorrt*_libs/lib*.so*",
             "runtime/**/dist-packages/nvidia/**/lib*.so*",
-            "runtime/**/dist-packages/tensorrt_libs/lib*.so*",
-            "runtime/**/dist-packages/tensorrt_cu12_libs/lib*.so*",
+            "runtime/**/dist-packages/tensorrt*_libs/lib*.so*",
         )
         for path in root.glob(pattern)
     }
@@ -614,6 +620,9 @@ def _copy_runtime(runtime: Path | None = None) -> None:
         "tensorrt-cu12",
         "tensorrt-cu12-bindings",
         "tensorrt-cu12-libs",
+        "tensorrt-cu13",
+        "tensorrt-cu13-bindings",
+        "tensorrt-cu13-libs",
         "vidgear",
         "colorlog",
     ):
